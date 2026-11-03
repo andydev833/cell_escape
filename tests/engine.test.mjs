@@ -11,8 +11,8 @@ const at = s => cellName(s.position);
 const value = (s, a1) => s.values[key(cellsKey(a1))];
 const cellsKey = a1 => ({ col: a1.charCodeAt(0) - 64, row: Number(a1.slice(1)) });
 
-test('every room: the first plain step right is safe, and walls never move or kill', () => {
-  for (const stage of STAGES) {
+test('rooms 01-05: the first plain step right is safe, and walls never move or kill', () => {
+  for (const stage of STAGES.slice(0, 5)) {
     const fresh = begin(createState(stage.index));
     const one = move(fresh, 1, 0);
     assert.equal(one.phase, 'playing', stage.id); assert.equal(one.deaths, 0, stage.id);

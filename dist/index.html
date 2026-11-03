@@ -21,6 +21,8 @@
         <div class="formula-bar" aria-hidden="true"><span id="cellAddress">B5</span><span class="formula-divider"></span><i>ƒx</i><span class="formula-content" id="cellValue">1</span></div>
         <div class="board-wrap" id="boardWrap">
           <canvas id="board" tabindex="0" aria-label="脱出する部屋。矢印キーで移動。右上のはてなボタンでヒント。" role="application"></canvas>
+          <textarea id="cellEditor" class="cell-editor" hidden spellcheck="false" autocomplete="off" aria-label="セルの内容"></textarea>
+          <div class="cmd-panel" id="cmdPanel" hidden role="dialog" aria-modal="false"></div>
           <button id="hintBtn" class="hint-button" aria-label="ヒントを開く" title="ヒント">?</button>
           <div class="focus-notice" id="focusNotice" hidden><button id="resumeBtn">クリックして戻る <span>↵</span></button></div>
           <div class="start-screen screen" id="startScreen"><div class="start-orbit" aria-hidden="true"><div class="little-cell"><i></i><i></i></div></div><span class="screen-kicker" id="startKicker">ROOM 01</span><h2>出口へ。</h2><button class="primary-button" id="startBtn">はじめる <span>↗</span></button><p class="keyboard-note"><svg viewBox="0 0 24 16" fill="none" stroke="currentColor"><rect x="1" y="1" width="22" height="14" rx="2"/><path d="M4 5h2m2 0h2m2 0h2m2 0h2M4 8h2m2 0h2m2 0h2m2 0h2M7 11h10"/></svg>キーボードでプレイ</p></div>

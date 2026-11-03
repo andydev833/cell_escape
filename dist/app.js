@@ -1,9 +1,11 @@
-import { STAGES, createState, begin, restart, move, extend, copy, cut, paste, cancelClipboard, cellName, key,
-  tokenOf, isBlank, deviceStatus, exitOpen, selectionRect, countTokens } from './engine.js';
+import { STAGES, stageOf, createState, begin, restart, move, extend, copy, cut, paste, cancelClipboard, cellName, key, fromKey, parseCell, parseRef,
+  tokenOf, isBlank, isFormula, deviceStatus, exitOpen, selectionRect, countTokens, test, displayValue, rawText, canEdit, commitEdit,
+  clearContents, undo, fill, selectColumn, selectRow, selectRegion, jumpTo, goHome, goEnd, findNext, replaceAll, toggleFilter,
+  applyFilter, filterChoices, numberFormat, toggleBold, answerConfirm, newSheet, cycleReference, hiddenSet, gotoRef, MAX_ROW, MAX_COL } from './engine.js';
 
 const $ = id => document.getElementById(id);
 const canvas = $('board'), ctx = canvas.getContext('2d');
-const hintDialog = $('hintDialog'), settingsDialog = $('settingsDialog');
+const hintDialog = $('hintDialog'), settingsDialog = $('settingsDialog'), panelEl = $('cmdPanel'), editor = $('cellEditor');
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || '');
 const safeRead = (key, fallback) => { try { const raw = localStorage.getItem(key); return raw === null ? fallback : JSON.parse(raw); } catch { return fallback; } };
 const safeWrite = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} };
@@ -19,6 +21,7 @@ let state = createState(room);
 let highestHint = 0, hintIndex = 0, inputArmed = false;
 let width = 0, height = 0, scale = 1, geo = null, audio = null;
 let animation = null, particles = [], trapFx = null, bump = null, pendingDeath = false, doorK = null;
+let panel = null, editing = null;
 // Cells whose trap this player has watched fire, per room. Survives retries, not reloads.
 const seenTraps = new Set();
 // Game time only advances while nothing is paused, so dialogs freeze every effect in place.
@@ -26,25 +29,33 @@ const seenTraps = new Set();
 let clock = 0, lastReal = null, attempt = 0, events = [];
 let focusTimer = null;
 const held = new Set();
-// Milliseconds after the trap is triggered (landing, or the end of the laser's look at the two keys).
+// Milliseconds after the trap is triggered (landing, or the end of the look at what caused it).
 const T = { drop: 60, impact: 180, burst: 240, result: 480 };
-const LASER_LOOK = 450;
-const IMPACT_SOUND = { ceilingPress: 'press', doorDrop: 'press', floorDrop: 'drop', fakeExit: 'drop', spikes: 'spike', laser: 'laser' };
-const ORDINALS = ['FIRST', 'SECOND', 'THIRD', 'FOURTH', 'FIFTH'];
+const LASER_LOOK = 450, CHANGE_LOOK = 260;
+const IMPACT_SOUND = { ceilingPress: 'press', doorDrop: 'press', fakeDoor: 'press', floorDrop: 'drop', fakeExit: 'drop', spikes: 'spike', laser: 'laser', blast: 'drop' };
+const ORDINALS = ['FIRST','SECOND','THIRD','FOURTH','FIFTH','SIXTH','SEVENTH','EIGHTH','NINTH','TENTH','ELEVENTH','TWELFTH','THIRTEENTH','FOURTEENTH','FIFTEENTH','SIXTEENTH','SEVENTEENTH','EIGHTEENTH','NINETEENTH','TWENTIETH','21ST','22ND','23RD','24TH','25TH','26TH','27TH','28TH','29TH','LAST'];
 const pad = n => String(n).padStart(2, '0');
-const forPlatform = text => isMac ? text.replaceAll('Ctrl', '⌘') : text;
+// Mac: ⌘ stands in for Ctrl, except where macOS owns ⌘ (⌘Space, ⌘H) and the room asks for ⌃ instead.
+const forPlatform = text => !isMac ? text : text.replaceAll('Ctrl', S.macCtrl ? '⌃' : '⌘').replaceAll('Alt', '⌥');
 const seenKey = p => `${room}:${key(p)}`;
+const same = (a, b) => a && b && a.col === b.col && a.row === b.row;
 
 function rounded(x,y,w,h,r,fill,stroke) {
   ctx.beginPath(); ctx.roundRect(x,y,w,h,r); if(fill){ctx.fillStyle=fill;ctx.fill();} if(stroke){ctx.strokeStyle=stroke;ctx.stroke();}
 }
+// Filtered rows take no space, so the grid keeps only the rows that are shown.
 function computeGeometry() {
-  const gutter = width < 500 ? 23 : 31, top = 27;
-  const cw = (width - gutter - 15) / S.visibleCols;
-  const ch = (height - top - 17) / S.visibleRows;
-  geo = { gutter, top, cw, ch };
+  const gutter = width < 500 ? 23 : 31, top = 27, hidden = hiddenSet(state), rows = [];
+  for (let r = 1; r <= S.visibleRows; r++) if (!hidden.has(r)) rows.push(r);
+  const cw = (width - gutter - 15) / S.visibleCols, ch = (height - top - 17) / Math.max(rows.length, 1);
+  geo = { gutter, top, cw, ch, rows, rowIdx: new Map(rows.map((r, i) => [r, i])) };
 }
-function point(p) { return { x: geo.gutter + (p.col - .5)*geo.cw, y: geo.top + (p.row - .5)*geo.ch }; }
+const shown = p => p.col >= 1 && p.col <= S.visibleCols && geo.rowIdx.has(p.row);
+function point(p) {
+  const i = geo.rowIdx.get(p.row);
+  return { x: geo.gutter + (p.col - .5)*geo.cw, y: geo.top + ((i ?? (p.row > S.visibleRows ? geo.rows.length + 1 : -1)) + .5)*geo.ch };
+}
+function cellBox(p) { const c = point(p); return { x: c.x - geo.cw/2, y: c.y - geo.ch/2, w: geo.cw, h: geo.ch }; }
 // Shared by floors, the character and every trap so they always meet at the same height.
 function at(p) {
   const { cw, ch } = geo, c = point(p), floorHeight = Math.min(ch*.7,36), size = Math.min(cw*.43,ch*.83,29);
@@ -52,12 +63,12 @@ function at(p) {
   return { x: c.x, floorY: c.y, floorTop: c.y - floorHeight*.5, floorHeight, size, standY, feetY: standY + size*.48, r: Math.max(4, size*.3), tx: c.x + cw*.2 };
 }
 function doorBox(p) {
-  const { cw, ch } = geo, L = at(p), dh = Math.min(ch*1.8,73), dw = Math.min(cw*.67,36), doorY = L.floorY + L.floorHeight*.28;
+  const { cw, ch } = geo, L = at(p), doorY = L.floorY + L.floorHeight*.28, dh = Math.max(12, Math.min(ch*1.8, 73, doorY - geo.top - 4)), dw = Math.min(cw*.67,36);
   return { ...L, dh, dw, doorY, ix: L.x-dw*.47, iy: doorY-dh+5, iw: dw*.94, ih: dh-7 };
 }
 function resize() {
   const rect = canvas.getBoundingClientRect(); width=rect.width;height=rect.height;scale=Math.min(devicePixelRatio||1,2);
-  canvas.width=Math.round(width*scale);canvas.height=Math.round(height*scale);ctx.setTransform(scale,0,0,scale,0,0);computeGeometry();draw(clock);
+  canvas.width=Math.round(width*scale);canvas.height=Math.round(height*scale);ctx.setTransform(scale,0,0,scale,0,0);computeGeometry();placeEditor();draw(clock);
 }
 function ghost(x,y,size,t,opacity=1,tilt=0,pose=null) {
   ctx.save(); ctx.translate(x,y);ctx.rotate(tilt);ctx.globalAlpha=opacity;
@@ -90,7 +101,7 @@ function poseFor(type,lt) {
   if(lt<T.impact)return {shock:true,hop:lt<T.drop&&!reduced};
   if(lt<(reduced?320:T.burst)) {
     if(type==='spikes')return {sx:.9,sy:.85,lift:true,tilt:.25};
-    if(type==='laser')return {sx:1.15,sy:.85,dim:true};
+    if(type==='laser'||type==='blast')return {sx:1.15,sy:.85,dim:true};
     return {sx:1.6,sy:.3};
   }
   return {hidden:true};
@@ -148,6 +159,12 @@ function drawLaser(p,lt) {
   ctx.beginPath();ctx.moveTo(x1,mid-gap);ctx.lineTo(x2,mid-gap);if(gap>1){ctx.moveTo(x1,mid+gap);ctx.lineTo(x2,mid+gap);}ctx.stroke();
   ctx.restore();
 }
+function drawBlast(p,lt) {
+  if(lt===null||lt<T.drop)return;
+  const L = at(p), k = reduced ? 1 : Math.min(1,(lt-T.drop)/(T.impact-T.drop)), r = geo.cw*.95*k;
+  if(lt<T.burst+120){ctx.save();ctx.globalAlpha=reduced?.5:Math.max(0,1-(lt-T.drop)/300);ctx.fillStyle='#f0a050';ctx.beginPath();ctx.arc(L.x,L.standY,r,0,Math.PI*2);ctx.fill();ctx.restore();}
+  ctx.fillStyle='#0d120c99';ctx.beginPath();ctx.ellipse(L.x,L.floorTop+3,geo.cw*.4,3,0,0,Math.PI*2);ctx.fill();
+}
 function drawHole(L,lt,t) {
   const { cw } = geo, k = reduced ? 1 : Math.min(1,(lt-T.drop)/80), x = L.x-cw*.5+1, w = cw-2;
   rounded(x,L.floorTop,w,L.floorHeight,2,'#070c08','#607b4544');
@@ -159,7 +176,7 @@ function drawHole(L,lt,t) {
   // Two flaps hinge down from the slab edges.
   for(const side of [-1,1]){ctx.save();ctx.translate(side<0?x:x+w,L.floorTop);ctx.rotate(side*-k*1.25);ctx.fillStyle='#34472b';ctx.fillRect(side<0?0:-w/2,0,w/2,3);ctx.restore();}
 }
-function drawDoor(p,{fake=false,lit=true,closed=0,style=null,won=false,t=0}) {
+function drawDoor(p,{fake=false,lit=true,closed=0,style=null,won=false}) {
   const D = doorBox(p), { x, dh, dw, doorY, ix, iy, iw, ih } = D;
   ctx.save();
   // A fake exit looks right at a glance: its frame is a touch crooked and there is a seam under it.
@@ -188,7 +205,7 @@ function drawDoor(p,{fake=false,lit=true,closed=0,style=null,won=false,t=0}) {
   ctx.fillStyle=lit?'#d5efb1':'#59654f';ctx.fillRect(x+dw*.18,doorY-dh*.47,2,4);
   if(fake){ctx.fillStyle='#070c08';ctx.fillRect(x-dw*.62,doorY+4,dw*1.24,1.5);}
   ctx.restore();
-  ctx.font='7px ui-monospace,monospace';ctx.fillStyle=lit?'#b0cc8e':'#56664c';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('EXIT',x,doorY-dh-10);
+  ctx.font='7px ui-monospace,monospace';ctx.fillStyle=lit?'#b0cc8e':'#56664c';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('EXIT',x,Math.max(geo.top+5,doorY-dh-8));
   if(lit){ctx.fillStyle='#a2ba7740';ctx.beginPath();ctx.ellipse(x,doorY+5,dw*.9,4,0,0,Math.PI*2);ctx.fill();}
 }
 function drawStone(x,y,r) {
@@ -201,23 +218,68 @@ function drawKey(x,y,r,color='#e0c36a') {
   ctx.beginPath();ctx.moveTo(x-r*.1,y);ctx.lineTo(x+r*1.05,y);ctx.moveTo(x+r*.65,y);ctx.lineTo(x+r*.65,y+r*.4);ctx.moveTo(x+r*1.02,y);ctx.lineTo(x+r*1.02,y+r*.5);ctx.stroke();
   ctx.restore();
 }
-function drawToken(v,p,danger=false) {
-  const L = at(p);
-  if(tokenOf(v)==='stone')drawStone(L.tx,L.floorTop-L.r*.45,L.r);
-  else if(tokenOf(v)==='key'){drawKey(L.tx-L.r*.25,L.floorTop-L.r*.75,L.r,danger?'#ff7a64':'#e0c36a');if(danger){ctx.strokeStyle='#ff5a4a';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(L.tx,L.floorTop-L.r*.75,L.r*1.6,0,Math.PI*2);ctx.stroke();}}
+function drawBattery(x,y,r,color='#9fd27a') {
+  rounded(x-r*.9,y-r*.55,r*1.7,r*1.1,2,'#26331f',color);rounded(x+r*.8,y-r*.22,r*.25,r*.44,1,color);
+  ctx.fillStyle=color;ctx.fillRect(x-r*.45,y-r*.08,r*.7,r*.16);ctx.fillRect(x-r*.18,y-r*.35,r*.16,r*.7);
 }
-// Monitor above the lock: one slot per allowed key, lit keys for the keys that exist.
-function drawMonitor(rule,lt) {
-  const lock = S.devices[0].cells[0], { cw, ch } = geo, c = point({ col: lock.col, row: 2 }), count = countTokens(state.values, rule.token);
-  const alarm = count>rule.limit || (trapFx?.type==='laser');
+function drawBomb(x,y,r) {
+  ctx.fillStyle='#1b1e19';ctx.beginPath();ctx.arc(x,y,r*.85,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#5c6450';ctx.lineWidth=1;ctx.stroke();
+  ctx.strokeStyle='#c99a5a';ctx.beginPath();ctx.moveTo(x+r*.5,y-r*.6);ctx.quadraticCurveTo(x+r*.9,y-r*1.3,x+r*1.2,y-r*1.1);ctx.stroke();
+  ctx.fillStyle='#f2c46a';ctx.beginPath();ctx.arc(x+r*1.2,y-r*1.1,Math.max(1.5,r*.18),0,Math.PI*2);ctx.fill();
+}
+function drawVoid(x,y,r) {
+  const g=ctx.createRadialGradient(x,y,0,x,y,r);g.addColorStop(0,'#000');g.addColorStop(.7,'#2a1636');g.addColorStop(1,'#6b3f86');
+  ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();
+}
+function drawSeal(x,y,r) {
+  ctx.fillStyle='#a8322b';ctx.beginPath();for(let i=0;i<10;i++){const a=i/10*Math.PI*2,rr=i%2?r*.85:r;ctx.lineTo(x+Math.cos(a)*rr,y+Math.sin(a)*rr);}ctx.fill();
+  ctx.fillStyle='#d9594c';ctx.beginPath();ctx.arc(x,y,r*.55,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#7a1f1a';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x-r*.25,y);ctx.lineTo(x+r*.25,y);ctx.moveTo(x,y-r*.25);ctx.lineTo(x,y+r*.25);ctx.stroke();
+}
+function drawTokenIcon(token,x,y,r,color) {
+  if(token==='seal'){drawSeal(x,y,r);return;}
+  if(token==='core'){ctx.save();if(!reduced){ctx.shadowColor='#bfe08a';ctx.shadowBlur=8;}ctx.fillStyle=color||'#cde7a0';ctx.beginPath();ctx.moveTo(x,y-r);ctx.lineTo(x+r*.8,y);ctx.lineTo(x,y+r);ctx.lineTo(x-r*.8,y);ctx.closePath();ctx.fill();ctx.restore();ctx.strokeStyle='#3b4a2c';ctx.lineWidth=1;ctx.stroke();return;}
+  if(token==='stone')drawStone(x,y,r);
+  else if(token==='key')drawKey(x-r*.25,y,r,color);
+  else if(token==='battery')drawBattery(x,y,r,color);
+  else if(token==='bomb')drawBomb(x,y,r);
+  else if(token==='void')drawVoid(x,y,r);
+}
+function drawToken(v,p,danger=false) {
+  const L = at(p), floor = S.floor.has(key(p));
+  const x = floor ? L.tx : L.x, y = floor ? L.floorTop-L.r*.6 : L.floorY;
+  drawTokenIcon(tokenOf(v),x,y,L.r,danger?'#ff7a64':undefined);
+  if(danger){ctx.strokeStyle='#ff5a4a';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(x,y,L.r*1.6,0,Math.PI*2);ctx.stroke();}
+}
+function drawLamp(x,y,lit) {
+  const lr=Math.max(3,Math.min(geo.cw*.08,6));
+  ctx.save();if(lit&&!reduced){ctx.shadowColor='#f2d27e';ctx.shadowBlur=12;}ctx.beginPath();ctx.arc(x,y,lr,0,Math.PI*2);ctx.fillStyle=lit?'#f2d27e':'#263124';ctx.fill();ctx.strokeStyle=lit?'#fff0b8':'#55684a';ctx.stroke();ctx.restore();
+}
+// A monitor that counts one kind of token: one slot per allowed token, red when there are too many.
+function drawMonitor(rule) {
+  const target = parseCell(rule.at), spot = rule.monitor ? parseCell(rule.monitor) : { col: target.col, row: 2 };
+  if(!shown(spot))return;
+  const { cw, ch } = geo, c = point(spot), count = countTokens(state.values, rule.token);
+  const alarm = count>rule.limit || (trapFx?.type==='laser'&&count>rule.limit);
   const w = Math.max(cw*1.5,42), h = Math.max(ch*.7,22), x = c.x-w/2, y = c.y-h/2;
-  ctx.strokeStyle='#4f6243';ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(c.x,y+h);ctx.lineTo(c.x,at(lock).floorTop-at(lock).r*1.6);ctx.stroke();ctx.setLineDash([]);
+  if(shown(target)){const L=at(target);ctx.strokeStyle='#4f6243';ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(c.x,y+h);ctx.lineTo(L.tx,L.floorTop-L.r*1.6);ctx.stroke();ctx.setLineDash([]);}
   rounded(x,y,w,h,3,'#0e1811',alarm?'#ff5a4a':'#56704a');
-  const shown = Math.max(rule.limit,count), r = Math.min(h*.2,w/(shown*3.2));
-  for(let i=0;i<shown;i++)drawKey(x+w*(i+.5)/shown,c.y,r,i<count?(alarm?'#ff6a54':'#b9df8f'):'#33452f');
+  const slots = Math.max(rule.limit,count), r = Math.min(h*.2,w/(slots*3.2));
+  for(let i=0;i<slots;i++)drawTokenIcon(rule.token,x+w*(i+.5)/slots,c.y,r,i<count?(alarm?'#ff6a54':'#b9df8f'):'#33452f');
+}
+function drawCellText(p,text,{bold=false,fill=null}={}) {
+  const b=cellBox(p), floor=S.floor.has(key(p)), L=at(p);
+  if(fill==='red'){rounded(b.x+3,b.y+3,b.w-6,b.h-6,3,'#b8453a40','#d0614f');}
+  const lines=String(text).split('\n'), size=Math.max(8,Math.min(11,geo.cw*.15));
+  ctx.font=`${bold?'800 ':''}${size}px ui-monospace,Consolas,monospace`;ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle=text==='1'?'#9eaf7740':'#d6e3c3';
+  const y0=floor?L.floorY+L.floorHeight*.14-(lines.length-1)*size*.55:L.floorY-(lines.length-1)*size*.55;
+  ctx.save();ctx.beginPath();ctx.rect(b.x+1,b.y,b.w-2,b.h);ctx.clip();
+  lines.forEach((line,i)=>{ctx.fillText(line,L.x-(floor&&text!=='1'?0:0),y0+i*size*1.1);if(bold){ctx.fillText(line,L.x+.6,y0+i*size*1.1);}});
+  ctx.restore();
 }
 function draw(t) {
   if(!geo || !width)return;
+  computeGeometry();
   ctx.clearRect(0,0,width,height);
   const { gutter, top, cw, ch }=geo;
   const lt=trapFx?t-trapFx.at:null, fxAt=p=>trapFx&&trapFx.col===p.col&&trapFx.row===p.row?lt:null;
@@ -231,82 +293,117 @@ function draw(t) {
   ctx.fillStyle='#1d291d';ctx.fillRect(0,0,width,top);ctx.fillRect(0,0,gutter,height);
   ctx.strokeStyle='#607c4524';ctx.lineWidth=.7;
   for(let c=0;c<=S.visibleCols;c++){const x=gutter+c*cw;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,height);ctx.stroke();}
-  for(let r=0;r<=S.visibleRows;r++){const y=top+r*ch;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(width,y);ctx.stroke();}
+  for(let i=0;i<=geo.rows.length;i++){const y=top+i*ch;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(width,y);ctx.stroke();
+    // Hidden rows leave a doubled line, like a filtered sheet.
+    if(i>0&&i<geo.rows.length&&geo.rows[i]-geo.rows[i-1]>1){ctx.strokeStyle='#8fb06a66';ctx.beginPath();ctx.moveTo(0,y+1.5);ctx.lineTo(width,y+1.5);ctx.stroke();ctx.strokeStyle='#607c4524';}}
   ctx.font=`${width<500?8:9}px ui-monospace,Consolas,monospace`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle='#6d8659';
   for(let c=1;c<=S.visibleCols;c++)ctx.fillText(String.fromCharCode(64+c),gutter+(c-.5)*cw,top*.5);
-  for(let r=1;r<=S.visibleRows;r++)ctx.fillText(String(r),gutter*.5,top+(r-.5)*ch);
+  geo.rows.forEach((r,i)=>ctx.fillText(String(r),gutter*.5,top+(i+.5)*ch));
 
-  const floorCells=[...S.floor].map(k=>{const [col,row]=k.split(',').map(Number);return {col,row};});
+  const floorCells=[...S.floor].map(fromKey).filter(shown);
   const deviceAt=new Map();for(const d of S.devices)d.cells.forEach((c,i)=>deviceAt.set(key(c),{d,i}));
+  const hazardAt=new Set(S.selectHazards.flatMap(h=>h.cells.map(key)));
   // Rails between floors on stacked rows: the way down is visible before anyone tries it.
-  for(const p of floorCells)if(S.floor.has(key({col:p.col,row:p.row+1}))){const a=at(p),b=at({col:p.col,row:p.row+1});ctx.fillStyle='#5d7a4890';for(const side of [-1,1])ctx.fillRect(a.x+side*cw*.2-1,a.floorTop+a.floorHeight,2,b.floorTop-a.floorTop-a.floorHeight);}
+  for(const p of floorCells){const below={col:p.col,row:p.row+1};if(S.floor.has(key(below))&&shown(below)){const a=at(p),b=at(below);ctx.fillStyle='#5d7a4890';for(const side of [-1,1])ctx.fillRect(a.x+side*cw*.2-1,a.floorTop+a.floorHeight,2,b.floorTop-a.floorTop-a.floorHeight);}}
   for(const p of floorCells) {
-    const L=at(p), x=L.x-cw*.5+1, trap=S.traps.get(key(p)), flt=fxAt(p), fired=flt!==null&&flt>=0, v=state.values[key(p)];
-    if(fired&&(trap?.type==='floorDrop'||trap?.type==='fakeExit'||trapFx.type==='floorDrop')&&flt>=T.drop){drawHole(L,flt,t);continue;}
+    const L=at(p), x=L.x-cw*.5+1, trap=S.traps.get(key(p)), flt=fxAt(p), fired=flt!==null&&flt>=0;
+    const holeType=trapFx&&(trapFx.type==='floorDrop'||trapFx.type==='fakeExit');
+    if(fired&&holeType&&flt>=T.drop){drawHole(L,flt,t);continue;}
     const sink=fired?(reduced?2:Math.min(2,flt/30)):0;
-    rounded(x,L.floorTop+sink*.5,cw-2,L.floorHeight,2,'#34472b','#607b4544');
-    ctx.fillStyle='#839e4c24';ctx.fillRect(x+1,L.floorTop+1,cw-4,2);
-    if(!S.floor.has(key({col:p.col,row:p.row+1}))){ctx.strokeStyle='#7c965c60';ctx.setLineDash([2,4]);ctx.beginPath();ctx.moveTo(x-1,L.floorTop+L.floorHeight+8);ctx.lineTo(x+cw-1,L.floorTop+L.floorHeight+8);ctx.stroke();ctx.setLineDash([]);}
-    if(v===1){ctx.font='8px ui-monospace,Consolas,monospace';ctx.fillStyle='#9eaf7740';ctx.textAlign='center';ctx.fillText('1',L.x-(deviceAt.has(key(p))?cw*.2:0),L.floorY+L.floorHeight*.14);}
+    // A bridge that has lost power sinks and goes dark.
+    const sunk=trap?.bridge&&test(S,state,trap.when);
+    rounded(x,L.floorTop+sink*.5+(sunk?L.floorHeight*.35:0),cw-2,L.floorHeight*(sunk?.65:1),2,sunk?'#1d2618':'#34472b',sunk?'#3b4a3366':'#607b4544');
+    if(!sunk){ctx.fillStyle=trap?.bridge?'#bfe08a55':'#839e4c24';ctx.fillRect(x+1,L.floorTop+1,cw-4,2);}
+    const belowFloor=S.floor.has(key({col:p.col,row:p.row+1}));
+    if(!belowFloor){ctx.strokeStyle='#7c965c60';ctx.setLineDash([2,4]);ctx.beginPath();ctx.moveTo(x-1,L.floorTop+L.floorHeight+8);ctx.lineTo(x+cw-1,L.floorTop+L.floorHeight+8);ctx.stroke();ctx.setLineDash([]);}
     if(trap?.type==='ceilingPress') {
       // The switch plate: a faint seam that sinks when stepped on.
       const sx=L.x-cw*.32, sw=cw*.64, sh=Math.max(3,L.floorHeight*.22);
       if(fired){ctx.fillStyle='#1a2516';ctx.fillRect(sx,L.floorTop+2,sw,sh+sink);}
       ctx.strokeStyle=fired?'#11190f':'#56693f70';ctx.lineWidth=1;ctx.strokeRect(sx,L.floorTop+2+sink,sw,sh);
-    } else if(trap?.type==='floorDrop') {
+    } else if(trap?.type==='floorDrop'&&!trap.bridge) {
       ctx.strokeStyle='#5d6e43';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(L.x-4,L.floorTop+3);ctx.lineTo(L.x+1,L.floorTop+L.floorHeight*.34);ctx.lineTo(L.x-2,L.floorY+1);ctx.stroke();
     } else if(trap?.type==='fakeExit') {
       ctx.fillStyle='#11190f99';ctx.fillRect(x+cw*.15,L.floorY-1,cw*.7,1.5);
     }
     const dev=deviceAt.get(key(p));
     if(dev?.d.kind==='selectAll') {
-      // Five identical plates, one lamp each.
       const lit=status[dev.d.id].lit[dev.i], ps=Math.min(cw*.5,L.floorHeight*.9);
       rounded(L.x-ps/2,L.floorTop+2+sink,ps,L.floorHeight*.5,2,lit?'#5d6f3c':'#3e5131',lit?'#e6c66f':'#6f8659');
       ctx.fillStyle=lit?'#f2d27e':'#7d9367';ctx.beginPath();ctx.moveTo(L.x,L.floorTop+4+sink);ctx.lineTo(L.x+ps*.16,L.floorTop+2+L.floorHeight*.25+sink);ctx.lineTo(L.x,L.floorTop+L.floorHeight*.5+sink);ctx.lineTo(L.x-ps*.16,L.floorTop+2+L.floorHeight*.25+sink);ctx.fill();
-      const ly=L.floorTop-ch*1.55, lr=Math.max(3,Math.min(cw*.09,7));
-      ctx.strokeStyle='#4f6243';ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(L.x,ly+lr);ctx.lineTo(L.x,L.floorTop-2);ctx.stroke();ctx.setLineDash([]);
-      ctx.save();if(lit&&!reduced){ctx.shadowColor='#f2d27e';ctx.shadowBlur=12;}ctx.beginPath();ctx.arc(L.x,ly,lr,0,Math.PI*2);ctx.fillStyle=lit?'#f2d27e':'#263124';ctx.fill();ctx.strokeStyle=lit?'#fff0b8':'#55684a';ctx.stroke();ctx.restore();
+      // One lamp per plate above it, unless another floor sits there.
+      if(!S.floor.has(key({col:p.col,row:p.row-1}))&&!S.floor.has(key({col:p.col,row:p.row-2}))){const ly=L.floorTop-ch*1.55;ctx.strokeStyle='#4f6243';ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(L.x,ly+5);ctx.lineTo(L.x,L.floorTop-2);ctx.stroke();ctx.setLineDash([]);drawLamp(L.x,ly,lit);}
     } else if(dev?.d.kind==='tokens') {
-      const r=L.r;
+      const r=L.r, v=state.values[key(p)];
       if(dev.d.token==='stone'){rounded(L.tx-r*1.4,L.floorTop-r*.1,r*2.8,r*.55,1.5,'#4c5a40','#71845d');
-        if(!status[dev.d.id].lit[dev.i]){ctx.strokeStyle='#8fa27a';ctx.setLineDash([2,2]);ctx.beginPath();ctx.ellipse(L.tx,L.floorTop-r*.45,r,r*.72,0,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);}}
-      else{rounded(L.tx-r*1.5,L.floorTop-r*1.6,r*3,r*1.55,2,'#22301f','#71845d');
-        if(tokenOf(v)!=='key'){ctx.fillStyle='#0b120b';ctx.beginPath();ctx.arc(L.tx,L.floorTop-r*.95,r*.25,0,Math.PI*2);ctx.fill();ctx.fillRect(L.tx-r*.1,L.floorTop-r*.95,r*.2,r*.5);}}
+        if(!status[dev.d.id].lit[dev.i]){ctx.strokeStyle='#8fa27a';ctx.setLineDash([2,2]);ctx.beginPath();ctx.ellipse(L.tx,L.floorTop-r*.6,r,r*.72,0,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);}}
+      else drawSocket(L,tokenOf(v)!==dev.d.token);
     }
-    if(S.shelf&&S.shelf.col===p.col&&S.shelf.row===p.row){ctx.fillStyle='#6f5f43';ctx.fillRect(L.tx-L.r*1.5,L.floorTop-L.r*.05,L.r*3,2.5);ctx.fillRect(L.tx-L.r*1.2,L.floorTop,2,L.r*.5);ctx.fillRect(L.tx+L.r*1.2-2,L.floorTop,2,L.r*.5);}
+    if(S.sockets.some(s=>same(s,p)))drawSocket(L,isBlank(state.values[key(p)]));
+    if(S.bulbs.some(b=>same(b,p))){const on=state.values[key(p)]===1;ctx.save();if(on&&!reduced){ctx.shadowColor='#f2d27e';ctx.shadowBlur=14;}ctx.beginPath();ctx.arc(L.x+cw*.28,L.floorTop-L.r*.7,L.r*.7,0,Math.PI*2);ctx.fillStyle=on?'#f2d27e':'#263124';ctx.fill();ctx.strokeStyle=on?'#fff0b8':'#6f8659';ctx.stroke();ctx.restore();
+      // An empty bulb shows the faint shape of the 1 it is waiting for.
+      if(isBlank(state.values[key(p)])){ctx.font=`${Math.max(9,Math.min(12,cw*.17))}px ui-monospace,monospace`;ctx.fillStyle='#9eaf7755';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('1',L.x,L.floorY+L.floorHeight*.12);}}
+    if(S.shelf&&same(S.shelf,p)){ctx.fillStyle='#6f5f43';ctx.fillRect(L.tx-L.r*1.5,L.floorTop-L.r*.05,L.r*3,2.5);ctx.fillRect(L.tx-L.r*1.2,L.floorTop,2,L.r*.5);ctx.fillRect(L.tx+L.r*1.2-2,L.floorTop,2,L.r*.5);}
     if(seenTraps.has(seenKey(p))&&!fired){ctx.strokeStyle='#b98a5f70';ctx.lineWidth=1;const sx=L.x-cw*.32,sw=cw*.64;ctx.beginPath();ctx.moveTo(sx+sw*.2,L.floorTop+L.floorHeight*.55);ctx.lineTo(sx+sw*.45,L.floorTop+L.floorHeight*.75);ctx.moveTo(sx+sw*.6,L.floorTop+L.floorHeight*.5);ctx.lineTo(sx+sw*.8,L.floorTop+L.floorHeight*.68);ctx.stroke();}
   }
-  // Values outside the floor (only reachable by pasting a wide range) still show as plain numbers.
-  for(const [k,v] of Object.entries(state.values)){if(S.floor.has(k)||isBlank(v)||tokenOf(v))continue;const [col,row]=k.split(',').map(Number);if(col>S.visibleCols||row>S.visibleRows)continue;const c=point({col,row});ctx.font='8px ui-monospace,Consolas,monospace';ctx.fillStyle='#9eaf7760';ctx.fillText(String(v),c.x,c.y);}
+  // Device terminals that are not floor: lit boxes in the grid, or arrows at the edge when they lie beyond it.
+  for(const d of S.devices)if(d.kind==='selectAll')d.cells.forEach((c,i)=>{
+    if(S.floor.has(key(c)))return;
+    const lit=status[d.id].lit[i];
+    if(shown(c)){const b=cellBox(c);rounded(b.x+b.w*.28,b.y+b.h*.25,b.w*.44,b.h*.5,3,lit?'#5d6f3c':'#23301f',lit?'#f2d27e':'#6f8659');drawLamp(b.x+b.w/2,b.y+b.h/2,lit);}
+    else if(c.row>S.visibleRows&&c.col<=S.visibleCols){const x=geo.gutter+(c.col-.5)*cw,y=height-9;ctx.fillStyle=lit?'#f2d27e':'#8fa27a';ctx.beginPath();ctx.moveTo(x-6,y-5);ctx.lineTo(x+6,y-5);ctx.lineTo(x,y+3);ctx.fill();}
+    else if(c.col>S.visibleCols&&geo.rowIdx.has(c.row)){const y=point({col:1,row:c.row}).y,x=width-8;ctx.fillStyle=lit?'#f2d27e':'#8fa27a';ctx.beginPath();ctx.moveTo(x-5,y-6);ctx.lineTo(x-5,y+6);ctx.lineTo(x+3,y);ctx.fill();}
+  });
+  // Red sensors react to being selected.
+  for(const k of hazardAt){const c=fromKey(k);if(!shown(c))continue;const b=cellBox(c),floor=S.floor.has(k);rounded(b.x+b.w*.3,floor?at(c).floorTop+2:b.y+b.h*.3,b.w*.4,floor?at(c).floorHeight*.45:b.h*.4,2,'#5a1f1a','#e0584e');}
+  for(const d of S.decor){if(!shown(d.at))continue;
+    if(d.star){const b=cellBox(d.at),r=Math.min(b.w,b.h)*.2,cx=b.x+b.w*.28,cy=b.y+b.h*.5;ctx.fillStyle='#f2d27e';ctx.beginPath();for(let i=0;i<10;i++){const a=-Math.PI/2+i*Math.PI/5,rr=i%2?r*.45:r;ctx.lineTo(cx+Math.cos(a)*rr,cy+Math.sin(a)*rr);}ctx.fill();}
+    if(d.text){const solved=d.solved&&test(S,state,d.when),c=cellBox(d.at),b=d.wide?{...c,x:c.x-c.w,w:c.w*2}:c,text=solved?d.solved:d.text,lines=text.split('\n');
+      ctx.strokeStyle=solved?'#f2d27e99':'#8fa27a66';ctx.setLineDash([2,2]);ctx.strokeRect(b.x+4,b.y+5,b.w-8,b.h-10);ctx.setLineDash([]);
+      // Shrink the lettering until the longest line fits the plate.
+      let size=Math.max(9,Math.min(13,cw*.2));ctx.font=`600 ${size}px Georgia,serif`;const widest=Math.max(...lines.map(l=>ctx.measureText(l).width));if(widest>b.w-12){size*=(b.w-12)/widest;ctx.font=`600 ${size}px Georgia,serif`;}
+      ctx.fillStyle=solved?'#f2d27e':'#a8bd92';ctx.textAlign='center';ctx.textBaseline='middle';const lh=size*1.15;lines.forEach((line,k)=>ctx.fillText(line,b.x+b.w/2,b.y+b.h/2+(k-(lines.length-1)/2)*lh));}
+    if(d.door)drawDoor(d.at,{closed:1,style:'closed',lit:false});}
+  // Plain cell contents: numbers, words, formulas (their results), formats and notes.
+  for(const [k,v] of Object.entries(state.values)){
+    const p=fromKey(k);if(!shown(p)||isBlank(v)||tokenOf(v))continue;
+    const f=state.formats[k]||{};drawCellText(p,displayValue(state,p),{bold:f.bold,fill:f.fill});
+  }
+  for(const [k,f] of Object.entries(state.formats)){const p=fromKey(k);if(shown(p)&&(isBlank(state.values[k])||tokenOf(state.values[k]))&&f.fill){const b=cellBox(p);rounded(b.x+3,b.y+3,b.w-6,b.h-6,3,'#b8453a30','#d0614f');}}
+  // Faint targets the room is waiting for, shown only while the cell is still empty.
+  for(const g of S.ghosts)if(shown(g.at)&&isBlank(state.values[key(g.at)])){const b=cellBox(g.at);ctx.strokeStyle='#8fa27a55';ctx.setLineDash([2,3]);ctx.strokeRect(b.x+4,b.y+4,b.w-8,b.h-8);ctx.setLineDash([]);ctx.font=`${Math.max(8,Math.min(11,cw*.15))}px ui-monospace,monospace`;ctx.fillStyle='#9eaf7766';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(g.text,b.x+b.w/2,b.y+b.h/2);}
+  for(const k of Object.keys(S.notes)){const p=fromKey(k);if(!shown(p))continue;const b=cellBox(p);ctx.fillStyle='#e0584e';ctx.beginPath();ctx.moveTo(b.x+b.w-1,b.y+1);ctx.lineTo(b.x+b.w-1,b.y+9);ctx.lineTo(b.x+b.w-9,b.y+1);ctx.fill();}
+  if(S.filter&&state.filter&&shown(S.filter.header)){const b=cellBox(S.filter.header),s=Math.min(14,b.h*.45),on=!!state.filter.allowed;rounded(b.x+b.w-s-3,b.y+b.h-s-3,s,s,2,on?'#3a5a2e':'#1d2a1b','#8fa27a');ctx.fillStyle=on?'#f2d27e':'#c9d8b5';ctx.beginPath();const cx=b.x+b.w-s/2-3,cy=b.y+b.h-s/2-3;ctx.moveTo(cx-s*.25,cy-s*.12);ctx.lineTo(cx+s*.25,cy-s*.12);ctx.lineTo(cx,cy+s*.18);ctx.fill();}
 
-  // Exits: lamps over the door for the stone room, a monitor for the key room.
+  // Exits, fake exits and the lamps that say what the exit still needs.
   const open=exitOpen(S,state);
   if(doorK===null)doorK=open?1:0;
-  const exitFx=fxAt(S.exit);
-  for(const [k,trap] of S.traps)if(trap.type==='fakeExit'){const [col,row]=k.split(',').map(Number),flt=fxAt({col,row});drawDoor({col,row},{fake:true,lit:!(flt!==null&&flt>=T.drop)});}
-  drawDoor(S.exit,{closed:S.door?1-doorK:0,style:S.door,won:state.phase==='won',t});
+  for(const [k,trap] of S.traps)if(trap.type==='fakeExit'||trap.type==='fakeDoor'){const p=fromKey(k);if(!shown(p))continue;const flt=fxAt(p);
+    if(trap.look==='closed')drawDoor(p,{closed:1,style:'closed',lit:false});else drawDoor(p,{fake:true,lit:!(flt!==null&&flt>=T.drop&&trap.type==='fakeExit')});}
+  if(S.exit&&shown(S.exit))drawDoor(S.exit,{closed:S.door?1-doorK:0,style:S.door,won:state.phase==='won'});
   const pedestals=S.devices.find(d=>d.kind==='tokens'&&d.token==='stone');
-  if(pedestals){const D=doorBox(S.exit),lr=Math.max(3,Math.min(cw*.08,6));status[pedestals.id].lit.forEach((lit,i)=>{const lx=D.x+(i?1:-1)*D.dw*.38,ly=D.doorY-D.dh-20;ctx.save();if(lit&&!reduced){ctx.shadowColor='#f2d27e';ctx.shadowBlur=12;}ctx.beginPath();ctx.arc(lx,ly,lr,0,Math.PI*2);ctx.fillStyle=lit?'#f2d27e':'#263124';ctx.fill();ctx.strokeStyle=lit?'#fff0b8':'#55684a';ctx.stroke();ctx.restore();});}
-  const limit=S.rules.find(r=>r.kind==='tokenLimit');
-  if(limit)drawMonitor(limit,lt);
-  const keyAlarm=limit&&(countTokens(state.values,limit.token)>limit.limit);
-  for(const [k,v] of Object.entries(state.values))if(tokenOf(v)){const [col,row]=k.split(',').map(Number);drawToken(v,{col,row},keyAlarm&&tokenOf(v)===limit.token);}
-  // The laser first traces every key it sees, so the cause is on screen before it fires.
-  if(keyAlarm&&trapFx?.type==='laser'&&lt<T.burst){
-    const lock=S.devices[0].cells[0],mc=point({col:lock.col,row:2});
+  const lamps=S.indicators.length?S.indicators.map(c=>test(S,state,c)):pedestals?status[pedestals.id].lit:[];
+  if(S.exit&&lamps.length&&shown(S.exit)){const D=doorBox(S.exit),gap=Math.min(D.dw*.8,cw*.32);lamps.forEach((lit,i)=>drawLamp(D.x+(i-(lamps.length-1)/2)*gap,Math.max(geo.top+6,D.doorY-D.dh-18),lit));}
+  const limits=S.rules.filter(r=>r.kind==='tokenLimit');
+  for(const rule of limits)drawMonitor(rule);
+  const over=new Set(limits.filter(r=>countTokens(state.values,r.token)>r.limit).map(r=>r.token));
+  for(const [k,v] of Object.entries(state.values))if(tokenOf(v)&&shown(fromKey(k)))drawToken(v,fromKey(k),over.has(tokenOf(v)));
+  // Before a laser fires, it traces what it found: the extra tokens, or the cell that broke the rule.
+  if(trapFx?.type==='laser'&&lt<T.burst){
     ctx.strokeStyle='#ff5a4acc';ctx.lineWidth=1.2;ctx.setLineDash([4,3]);ctx.lineDashOffset=reduced?0:-t/30;
-    for(const [k,v] of Object.entries(state.values))if(tokenOf(v)===limit.token){const [col,row]=k.split(',').map(Number),L=at({col,row});ctx.beginPath();ctx.moveTo(mc.x,mc.y+geo.ch*.35);ctx.lineTo(L.tx,L.floorTop-L.r*.75);ctx.stroke();}
+    for(const rule of limits)if(over.has(rule.token)){const spot=rule.monitor?parseCell(rule.monitor):{col:parseCell(rule.at).col,row:2},mc=point(spot);
+      for(const [k,v] of Object.entries(state.values))if(tokenOf(v)===rule.token){const L=at(fromKey(k));ctx.beginPath();ctx.moveTo(mc.x,mc.y+ch*.35);ctx.lineTo(L.tx,L.floorTop-L.r*.75);ctx.stroke();}}
+    if(!over.size){const b=cellBox(state.trap);ctx.strokeRect(b.x+2,b.y+2,b.w-4,b.h-4);}
     ctx.setLineDash([]);ctx.lineDashOffset=0;
   }
 
-  const rect=selectionRect(state);
+  const rect=selectionRect(state), vis={c1:rect.c1,r1:rect.r1,c2:Math.min(rect.c2,S.visibleCols),r2:Math.min(rect.r2,S.visibleRows)};
   const ranged=(state.phase==='playing'||state.phase==='failed')&&(rect.c1!==rect.c2||rect.r1!==rect.r2);
-  if(ranged){const x=gutter+(rect.c1-1)*cw,y=top+(rect.r1-1)*ch,w=(rect.c2-rect.c1+1)*cw,h=(rect.r2-rect.r1+1)*ch;ctx.fillStyle='#b9df8f1c';ctx.fillRect(x,y,w,h);ctx.strokeStyle='#b9df8f99';ctx.lineWidth=1;ctx.strokeRect(x+.5,y+.5,w-1,h-1);}
-  if(state.clipboard&&state.phase==='playing'){const r=state.clipboard.rect,x=gutter+(r.c1-1)*cw,y=top+(r.r1-1)*ch,w=(r.c2-r.c1+1)*cw,h=(r.r2-r.r1+1)*ch;
-    ctx.strokeStyle=state.clipboard.mode==='cut'?'#f2d27e':'#c3e9ad';ctx.lineWidth=1.5;ctx.setLineDash([4,3]);ctx.lineDashOffset=reduced?0:-t/40;ctx.strokeRect(x+2,y+2,w-4,h-4);ctx.setLineDash([]);ctx.lineDashOffset=0;}
+  const rectBox=r=>{const rs=geo.rows.filter(x=>x>=r.r1&&x<=r.r2);if(!rs.length)return null;const y1=point({col:1,row:rs[0]}).y-ch/2,y2=point({col:1,row:rs[rs.length-1]}).y+ch/2;return {x:gutter+(r.c1-1)*cw,y:y1,w:(r.c2-r.c1+1)*cw,h:y2-y1};};
+  if(ranged){const b=rectBox(vis);if(b){ctx.fillStyle='#b9df8f1c';ctx.fillRect(b.x,b.y,b.w,b.h);ctx.strokeStyle='#b9df8f99';ctx.lineWidth=1;ctx.strokeRect(b.x+.5,b.y+.5,b.w-1,b.h-1);}}
+  if(state.clipboard&&state.phase==='playing'){const b=rectBox(state.clipboard.rect);if(b){ctx.strokeStyle=state.clipboard.mode==='cut'?'#f2d27e':'#c3e9ad';ctx.lineWidth=1.5;ctx.setLineDash([4,3]);ctx.lineDashOffset=reduced?0:-t/40;ctx.strokeRect(b.x+2,b.y+2,b.w-4,b.h-4);ctx.setLineDash([]);ctx.lineDashOffset=0;}}
 
-  const a=animation, start=at(S.start), size=start.size;
+  const a=animation, size=at(S.start).size;
   const here=at(state.phase==='ready'?S.start:state.position);
   let p={x:here.x,y:here.standY};
   if(a) {
@@ -322,7 +419,7 @@ function draw(t) {
   if(pose?.lift)p.y-=size*.3;
   if(bump&&!reduced){const k=(t-bump.at)/140;if(k<1){const off=Math.sin(Math.PI*k)*3;p.x+=bump.dx*off;p.y+=bump.dy*off;}}
   if(state.phase==='playing'&&!reduced&&!a)p.y+=Math.sin(t/450)*1.2;
-  if(!pose?.hidden&&(state.phase!=='won'||animation)) {
+  if(!pose?.hidden&&(state.phase!=='won'||animation)&&(state.phase==='ready'||geo.rowIdx.has(state.position.row))) {
     if(pose?.fall!==undefined){
       // Falling through the opened floor: clipped at the hole so it drops out of sight.
       const L=at(trapFx),k=pose.fall;ctx.save();ctx.beginPath();ctx.rect(0,0,width,L.floorTop+L.floorHeight);ctx.clip();
@@ -330,18 +427,22 @@ function draw(t) {
     } else ghost(p.x,p.y,size,t,pose?.dim?.7:1,pose?.tilt||0,pose);
   }
   if(pose?.shock&&pose.fall===undefined){ctx.font=`bold ${Math.max(11,size*.6)}px ui-monospace,monospace`;ctx.fillStyle='#f2d27e';ctx.textAlign='center';ctx.fillText('!',p.x+size*.5,p.y-size*.75);}
-  for(const [k,trap] of S.traps)if(trap.type==='ceilingPress'){const [col,row]=k.split(',').map(Number);drawDrop({col,row},fxAt({col,row}),'press');}
-  if(trapFx?.type==='doorDrop')drawDrop(trapFx,lt,'shutter');
-  if(trapFx?.type==='spikes')drawSpikes(trapFx,lt);
-  if(trapFx?.type==='laser')drawLaser(trapFx,lt);
-  if(state.phase==='playing'||state.phase==='ready') {
+  for(const [k,trap] of S.traps)if(trap.type==='ceilingPress'){const c=fromKey(k);if(shown(c))drawDrop(c,fxAt(c),'press');}
+  if(trapFx&&shown(trapFx)){
+    if(trapFx.type==='ceilingPress'&&!S.traps.has(key(trapFx)))drawDrop(trapFx,lt,'press');
+    if(trapFx.type==='doorDrop'||trapFx.type==='fakeDoor')drawDrop(trapFx,lt,'shutter');
+    if(trapFx.type==='spikes')drawSpikes(trapFx,lt);
+    if(trapFx.type==='laser')drawLaser(trapFx,lt);
+    if(trapFx.type==='blast')drawBlast(trapFx,lt);
+  }
+  if((state.phase==='playing'||state.phase==='ready')&&shown(state.position)) {
     const selected=point(state.phase==='ready'?S.start:state.position);
     ctx.strokeStyle='#b9df8f';ctx.lineWidth=1.5;ctx.strokeRect(selected.x-cw*.5+1,selected.y-ch*.5+1,cw-2,ch-2);
     if(!ranged){ctx.fillStyle='#cceca5';ctx.fillRect(selected.x+cw*.5-3,selected.y+ch*.5-3,4,4);}
-    else{const e=point(state.selectionEnd);ctx.fillStyle='#cceca5';ctx.fillRect(gutter+rect.c2*cw-3,top+rect.r2*ch-3,4,4);ctx.strokeStyle='#b9df8f66';ctx.strokeRect(e.x-cw*.5+1.5,e.y-ch*.5+1.5,cw-3,ch-3);}
     // A wall answers with a short tick on the side that was pushed, never with a trap effect.
-    if(bump){const k=(t-bump.at)/220;if(k<1){ctx.strokeStyle=`rgba(214,236,184,${.8*(1-k)})`;ctx.lineWidth=2;ctx.beginPath();
-      if(bump.dx){const x=selected.x+bump.dx*(cw*.5-1);ctx.moveTo(x,selected.y-ch*.32);ctx.lineTo(x,selected.y+ch*.32);}
+    if(bump){const k=(t-bump.at)/220;if(k<1){ctx.strokeStyle=bump.lock?`rgba(242,210,126,${.9*(1-k)})`:`rgba(214,236,184,${.8*(1-k)})`;ctx.lineWidth=2;ctx.beginPath();
+      if(bump.lock){ctx.strokeRect(selected.x-cw*.5+3,selected.y-ch*.5+3,cw-6,ch-6);}
+      else if(bump.dx){const x=selected.x+bump.dx*(cw*.5-1);ctx.moveTo(x,selected.y-ch*.32);ctx.lineTo(x,selected.y+ch*.32);}
       else{const y=selected.y+bump.dy*(ch*.5-1);ctx.moveTo(selected.x-cw*.32,y);ctx.lineTo(selected.x+cw*.32,y);}
       ctx.stroke();}}
   }
@@ -353,6 +454,10 @@ function draw(t) {
   if(shaking)ctx.restore();
   // One soft warm pulse at impact. Never white, never repeated.
   if(!reduced&&lt!==null&&lt>=T.impact&&lt<T.impact+160){ctx.fillStyle=`rgba(224,122,78,${.16*(1-(lt-T.impact)/160)})`;ctx.fillRect(0,0,width,height);}
+}
+function drawSocket(L,empty) {
+  const r=L.r;rounded(L.tx-r*1.5,L.floorTop-r*1.6,r*3,r*1.55,2,'#22301f','#71845d');
+  if(empty){ctx.fillStyle='#0b120b';ctx.beginPath();ctx.arc(L.tx,L.floorTop-r*.95,r*.25,0,Math.PI*2);ctx.fill();ctx.fillRect(L.tx-r*.1,L.floorTop-r*.95,r*.2,r*.5);}
 }
 function paused(){return isModal()||document.hidden;}
 function frame(real){
@@ -366,7 +471,7 @@ function frame(real){
   draw(clock);requestAnimationFrame(frame);
 }
 function schedule(delay,fn){const id=attempt;events.push({at:clock+delay,fn:()=>{if(id===attempt)fn();}});}
-function cancelAttempt(){attempt++;events=[];particles=[];trapFx=null;animation=null;bump=null;pendingDeath=false;doorK=null;}
+function cancelAttempt(){attempt++;events=[];particles=[];trapFx=null;animation=null;bump=null;pendingDeath=false;doorK=null;closePanel(false,false);closeEditor(false);}
 function announce(text){$('announcement').textContent=text;}
 function persistSettings(){safeWrite('cell-escape.settings',{sound,reduced});}
 function audioReady(){try{audio ||= new (window.AudioContext||window.webkitAudioContext)();if(audio.state==='suspended')audio.resume().catch(()=>{});}catch{}}
@@ -390,27 +495,37 @@ function beep(kind){
 }
 function settingsUI(){document.body.classList.toggle('reduce-motion',reduced);$('soundStatus').textContent=sound?'ON':'OFF';$('soundBtn').setAttribute('aria-pressed',String(sound));$('soundBtn').setAttribute('aria-label',sound?'音をオフにする':'音をオンにする');$('soundToggle').checked=sound;$('motionToggle').checked=reduced;}
 function isModal(){return hintDialog.open||settingsDialog.open;}
-function focusGame(){held.clear();inputArmed=true;$('focusNotice').hidden=true;if(!isModal())canvas.focus({preventScroll:true});}
-function valueText(v){return isBlank(v)?'':tokenOf(v)==='stone'?'STONE':tokenOf(v)==='key'?v.id:String(v);}
+function focusGame(){held.clear();inputArmed=true;$('focusNotice').hidden=true;if(!isModal()&&!panel&&!editing)canvas.focus({preventScroll:true});}
 function sync(){
-  $('cellAddress').textContent=cellName(state.position);$('cellValue').textContent=valueText(state.values[key(state.position)]);
+  // The board follows whichever sheet is active (a new sheet is its own small room).
+  S=stageOf(state);computeGeometry&&geo&&computeGeometry();
+  const v=state.values[key(state.position)];
+  $('cellAddress').textContent=cellName(state.position);
+  if(!editing)$('cellValue').textContent=isFormula(v)?v.f:rawText(v).replace(/\n/g,' ⏎ ');
   // Until the trap lands, the death has happened in the rules but not yet on screen.
   $('deathCount').textContent=pad(state.deaths-(pendingDeath?1:0));
   $('sheetStatus').textContent=pendingDeath?'IN THE ROOM':{ready:'READY',playing:'IN THE ROOM',failed:'CAUGHT',won:'ESCAPED'}[state.phase];
   $('startScreen').hidden=state.phase!=='ready';
+  // Panels sit on the half of the board away from the character, so the cell they act on stays visible.
+  panelEl.classList.toggle('low',state.position.row<=Math.ceil(S.visibleRows/2));
+  if(state.panel?.kind==='confirm'&&panel?.kind!=='confirm')openPanel('confirm');
+  if(!state.panel&&panel?.kind==='confirm')closePanel(false);
 }
 function renderTabs(){
-  $('sheetTabs').replaceChildren(...STAGES.map((st,i)=>{
-    const b=document.createElement('button');b.className='sheet-tab'+(i===room?' active':'');b.disabled=i>progress&&i!==room;
+  const tabs=STAGES.map((st,i)=>{
+    const b=document.createElement('button');b.className='sheet-tab'+(i===room&&state.sheet!=='new'?' active':'');b.disabled=i>progress&&i!==room;
     b.innerHTML=`<span class="tab-dot"></span><span class="tab-word">Room </span>${pad(st.number)}`;
     b.setAttribute('aria-label',`第${st.number}室${b.disabled?'（まだ開いていない）':''}`);if(i===room)b.setAttribute('aria-current','page');
     b.addEventListener('click',()=>enterRoom(i));return b;
-  }));
+  });
+  if(state.sheet==='new'){const b=document.createElement('button');b.className='sheet-tab active';b.innerHTML=`<span class="tab-dot"></span>${STAGES[room].newSheet?.name||'Sheet2'}`;b.disabled=true;tabs.splice(room+1,0,b);}
+  $('sheetTabs').replaceChildren(...tabs);
+  $('sheetTabs').querySelector('.active')?.scrollIntoView({block:'nearest',inline:'nearest'});
 }
 function applyRoom(){
   S=STAGES[room];
   $('roomEyebrow').textContent=$('startKicker').textContent=`ROOM ${pad(S.number)}`;
-  const dot=document.createElement('span');dot.textContent='。';$('roomTitle').replaceChildren(S.title,dot);
+  const dot=document.createElement('span');dot.textContent='。';$('roomTitle').replaceChildren(S.title.replace(/[。？]$/,''),S.title.endsWith('？')?Object.assign(dot,{textContent:'？'}):dot);
   $('roomLead').textContent=S.lead;$('roomIndex').textContent=pad(S.number);
   $('buildLabel').textContent=`THE ${ORDINALS[room]} ROOM`;$('fileName').textContent=`room_${pad(S.number)}.xlsx`;
   $('gameShell').setAttribute('aria-label',`第${S.number}室`);
@@ -422,10 +537,11 @@ function enterRoom(i){
   applyRoom();sync();$('startBtn').focus({preventScroll:true});
 }
 function start(){cancelAttempt();$('resultScreen').hidden=true;state=begin(state);sync();focusGame();audioReady();}
-function retry(){cancelAttempt();$('resultScreen').hidden=true;state=restart(state);sync();focusGame();beep('move');}
+function retry(){cancelAttempt();$('resultScreen').hidden=true;state=restart(state);renderTabs();sync();focusGame();beep('move');}
 const hasNext=()=>room<STAGES.length-1;
 function showResult(){
   const won=state.phase==='won', next=won&&hasNext(), result=$('resultScreen');
+  closePanel(false);closeEditor(false);
   result.className=`result-screen screen ${won?'won':'failed'}`;
   $('resultKicker').textContent=won?'ESCAPED':'TRY AGAIN';$('resultTitle').textContent=won?'抜け出した。':'やられた。';
   $('resultSubtitle').textContent=won?(hasNext()?'扉の向こうに、たどり着いた。':'最後の扉を、抜けた。'):'';$('resultSubtitle').hidden=!won;
@@ -443,9 +559,10 @@ function dust(){
   const L=at(trapFx),y=L.feetY-L.size*.2;
   particles.push(...Array.from({length:4},(_,i)=>{const side=i<2?-1:1;return{x:L.x+side*geo.cw*.42,y,vx:side*geo.cw*(.3+i%2*.2),vy:-4-i%2*4,g:0,at:clock,life:300,size:2,spin:0,color:'#9aa68a'};}));
 }
-// The trap timeline starts when the character lands (or after the laser has shown both keys), never on the key press.
+// The trap timeline starts when the character lands (or after a short look at what caused it), never on the key press.
 function startTrap(delay){
   const t=state.trap;pendingDeath=true;trapFx={...t,at:clock+delay};
+  closePanel(false);closeEditor(false);
   if(t.type==='laser')beep('alarm');
   schedule(delay,()=>beep('click'));
   schedule(delay+T.drop,()=>seenTraps.add(seenKey(t)));
@@ -453,35 +570,157 @@ function startTrap(delay){
   schedule(delay+T.burst,burst);
   schedule(delay+T.result,showResult);
 }
+const VALUE_KINDS=new Set(['paste','edit','delete','fill','undo','replace','format','confirm']);
 function act(next,kind,dx=0,dy=0){
   const previous=state;
-  if(next===previous){if(kind==='move'&&previous.phase==='playing'){bump={dx,dy,at:clock};beep('bump');}return;}
+  if(next===previous){
+    if((kind==='move'||kind==='jump')&&previous.phase==='playing'&&!previous.panel){bump={dx,dy,at:clock};beep('bump');}
+    if(kind==='locked'){bump={dx:0,dy:0,lock:true,at:clock};beep('bump');}
+    return false;
+  }
   state=next;bump=null;
-  const duration=kind==='move'?(reduced?0:state.jump?350:115):0;
-  if(kind==='move')animation={from:previous.position,to:state.position,at:clock,duration,jump:state.jump};
-  if(state.phase==='failed')startTrap(kind==='paste'?(reduced?250:LASER_LOOK):duration);
+  const moved=!same(previous.position,state.position)&&previous.sheet===state.sheet;
+  const duration=moved?(reduced?0:(state.jump||kind==='jump')?350:115):0;
+  if(moved)animation={from:previous.position,to:state.position,at:clock,duration,jump:state.jump||kind==='jump'};
+  if(state.phase==='failed')startTrap(moved?duration:VALUE_KINDS.has(kind)?(state.reason==='laser'?(reduced?250:LASER_LOOK):(reduced?120:CHANGE_LOOK)):0);
   else if(state.phase==='won'){
     beep('win');announce('抜け出した。');progress=Math.max(progress,room+1);safeWrite('cell-escape.progress',progress);renderTabs();
-    const p=point(S.exit);particles=Array.from({length:32},(_,i)=>({x:p.x,y:p.y-30,vx:Math.cos(i)*100,vy:Math.sin(i)*100-45,g:50,at:clock,life:900,size:3,spin:0,color:i%2?'#c7e8a8':'#e6ebcb'}));
+    closePanel(false);
+    if(S.exit){const p=point(S.exit);particles=Array.from({length:32},(_,i)=>({x:p.x,y:p.y-30,vx:Math.cos(i)*100,vy:Math.sin(i)*100-45,g:50,at:clock,life:900,size:3,spin:0,color:i%2?'#c7e8a8':'#e6ebcb'}));}
     schedule(reduced?0:600,showResult);
   }else{
-    beep(kind==='move'?'move':'tick');
+    if(previous.sheet!==state.sheet){renderTabs();announce('新しいシート。');}
+    beep(kind==='move'||kind==='jump'?'move':'tick');
     if(!exitOpen(S,previous)&&exitOpen(S,state))schedule(duration+80,()=>{beep('open');announce('扉が開いた。');});
   }
-  sync();
+  sync();return true;
 }
+
+// ---- in-game panels: confirm, find, replace, go to, filter, paste special, note ----
+function el(tag,attrs={},...kids){const n=document.createElement(tag);for(const [k,v] of Object.entries(attrs)){if(k==='class')n.className=v;else if(k.startsWith('on'))n.addEventListener(k.slice(2),v);else n.setAttribute(k,v);}n.append(...kids);return n;}
+function openPanel(kind){
+  if(state.phase!=='playing')return;
+  closeEditor(false);
+  const status=el('div',{class:'cmd-status','aria-live':'polite'}), say=t=>{status.textContent=t;};
+  const title=(t,k)=>el('div',{class:'cmd-title'},el('span',{},t),el('span',{},k?forPlatform(k):''));
+  const actions=(...b)=>el('div',{class:'cmd-actions'},...b);
+  const closeBtn=el('button',{type:'button',onclick:()=>closePanel()},'閉じる');
+  let body=[], first=null, enter=null;
+  panelEl.className='cmd-panel';
+  if(kind==='confirm'){
+    panelEl.classList.add('confirm');
+    // Only OK is offered, and only from the keyboard (a keyboard-made click has detail 0). Esc is the way to say no.
+    const byKeyboard=e=>{if(e.detail===0)return true;say('マウスは使わないで。');first.focus({preventScroll:true});return false;};
+    const ok=el('button',{type:'button',class:'go',onclick:e=>{if(!byKeyboard(e))return;panel=null;panelEl.hidden=true;act(answerConfirm(state,true),'confirm');}},'OK');
+    body=[el('div',{class:'art','aria-hidden':'true'},'🗝 → ✕'),el('div',{class:'big'},'扉の鍵を、処分しますか？'),status,actions(ok)];first=ok;
+  } else if(kind==='find'){
+    const input=el('input',{type:'text','aria-label':'検索する文字列'});
+    enter=()=>{const hit=findNext(state,input.value);if(!hit){say('見つかりません。');return;}if(!act(jumpTo(state,hit),'jump'))say(`${cellName(hit)} には立てない。`);else say(`${cellName(hit)}`);};
+    body=[title('検索','Ctrl+F'),input,status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'次を検索'),closeBtn)];first=input;
+  } else if(kind==='replace'){
+    const find=el('input',{type:'text','aria-label':'検索する文字列'}),to=el('input',{type:'text','aria-label':'置換後の文字列'}),r=selectionRect(state);
+    const scope=r.c1!==r.c2||r.r1!==r.r2?`対象：選択範囲 ${cellName({col:r.c1,row:r.r1})}:${cellName({col:Math.min(r.c2,S.visibleCols),row:Math.min(r.r2,MAX_ROW)})}`:'対象：シート全体';
+    enter=()=>{const res=replaceAll(state,find.value,to.value);if(!res.count){say('見つかりません。');return;}act(res.state,'replace');if(state.phase==='playing')say(`${res.count} 件を置換しました。`);};
+    body=[title('置換','Ctrl+H'),el('label',{},'検索する文字列'),find,el('label',{},'置換後の文字列'),to,el('div',{class:'scope'},scope),status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'すべて置換'),closeBtn)];first=find;
+  } else if(kind==='goto'){
+    const input=el('input',{type:'text','aria-label':'参照先'});
+    enter=()=>{const p=parseRef(input.value);if(!p){say('セル番地を入力してください。');return;}if(S.noGoto){say('その番地へは、跳べない。');return;}if(!act(gotoRef(state,p),'jump'))say(`${cellName(p)} には立てない。`);else closePanel();};
+    body=[title('ジャンプ','Ctrl+G'),el('label',{},'参照先'),input,status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'OK'),closeBtn)];first=input;
+  } else if(kind==='filter'){
+    const allowed=state.filter.allowed, boxes=filterChoices(state).map(v=>{const c=el('input',{type:'checkbox'});c.checked=!allowed||allowed.includes(v);c.dataset.value=v;return c;});
+    enter=()=>{const chosen=boxes.filter(b=>b.checked).map(b=>b.dataset.value);if(!chosen.length){say('ひとつ以上選んでください。');return;}act(applyFilter(state,chosen),'filter');closePanel();};
+    body=[title(cellName(S.filter.header),'Alt+↓'),...boxes.map(b=>el('label',{class:'choice'},b,b.dataset.value)),status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'OK'),closeBtn)];first=boxes[0];
+  } else if(kind==='pasteSpecial'){
+    const all=el('input',{type:'radio',name:'ps',value:'all'}),values=el('input',{type:'radio',name:'ps',value:'values'});all.checked=true;
+    enter=()=>{const r=act(paste(state,values.checked?'values':'all'),'paste');closePanel();if(!r)bump={dx:0,dy:0,lock:true,at:clock};};
+    panelEl.dataset.letters='1';
+    body=[title('形式を選択して貼り付け','Ctrl+Alt+V'),el('label',{class:'choice'},all,'すべて (A)'),el('label',{class:'choice'},values,'値 (V)'),status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'OK'),closeBtn)];first=all;
+    panel={kind,enter,pick:l=>{if(l==='v')values.checked=true;if(l==='a')all.checked=true;}};
+  } else if(kind==='note'){
+    body=[title(`${cellName(state.position)} のメモ`,'Shift+F2'),el('div',{class:'note-body'},S.notes[key(state.position)]),actions(closeBtn)];first=closeBtn;
+  }
+  if(!panel||panel.kind!==kind)panel={kind,enter};
+  panelEl.replaceChildren(...body);panelEl.hidden=false;held.clear();
+  first?.focus({preventScroll:true});
+}
+// Closing the confirm panel any way but OK is the cancel answer, except when a retry is throwing the attempt away.
+function closePanel(refocus=true,answer=true){
+  if(!panel&&panelEl.hidden)return;
+  const kind=panel?.kind;panel=null;panelEl.hidden=true;panelEl.replaceChildren();delete panelEl.dataset.letters;
+  if(answer&&kind==='confirm'&&state.panel)act(answerConfirm(state,false),'confirm');
+  if(refocus)focusGame();
+}
+// In-game panels are answered from the keyboard. A pointer click (detail > 0) on a control is refused; text fields can still be clicked into.
+panelEl.addEventListener('click',e=>{
+  const t=e.target;
+  if(e.detail>0&&t instanceof HTMLElement&&t.closest('button,label,input[type=checkbox],input[type=radio]')){
+    e.preventDefault();e.stopImmediatePropagation();
+    const status=panelEl.querySelector('.cmd-status');if(status)status.textContent='マウスは使わないで。';
+  }
+},true);
+panelEl.addEventListener('keydown',e=>{
+  if(e.isComposing||e.keyCode===229){e.stopPropagation();return;}
+  if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closePanel();return;}
+  if(panel?.pick&&!e.ctrlKey&&!e.metaKey&&/^[av]$/i.test(e.key)){e.preventDefault();panel.pick(e.key.toLowerCase());return;}
+  if(e.key==='Enter'&&panel?.enter&&!e.repeat&&!(e.target instanceof HTMLButtonElement)){e.preventDefault();e.stopPropagation();panel.enter();}
+  if(e.key==='Enter'&&e.repeat)e.preventDefault();
+  e.stopPropagation();
+});
+
+// ---- in-cell editor: F2 keeps the content, typing replaces it ----
+function placeEditor(){
+  if(!editing||!geo)return;
+  const b=cellBox(state.position);
+  Object.assign(editor.style,{left:`${b.x}px`,top:`${b.y}px`,minWidth:`${Math.max(b.w*2,120)}px`,height:`${Math.max(b.h,editor.value.split('\n').length*17+10)}px`});
+}
+function openEditor(text,caretEnd=true){
+  if(!canEdit(state)){act(state,'locked');return;}
+  closePanel(false);
+  editing={};editor.value=text;editor.hidden=false;placeEditor();
+  editor.focus({preventScroll:true});const n=caretEnd?text.length:0;editor.setSelectionRange(n,n);
+  $('cellValue').textContent=text;held.clear();
+}
+function closeEditor(refocus=true){
+  if(!editing)return;
+  editing=null;editor.hidden=true;editor.blur();sync();if(refocus)focusGame();
+}
+function commitEditor(all){
+  const text=editor.value;editing=null;editor.hidden=true;
+  const ok=act(commitEdit(state,text,{all}),'edit');
+  if(!ok)act(state,'locked');
+  sync();focusGame();
+}
+editor.addEventListener('keydown',e=>{
+  e.stopPropagation();
+  // While an IME is composing, Enter confirms the conversion, not the cell.
+  if(e.isComposing||e.keyCode===229)return;
+  if(e.key==='Escape'){e.preventDefault();closeEditor();return;}
+  if(e.key==='Enter'){
+    e.preventDefault();if(e.repeat)return;
+    // Alt+Enter: a new line inside the same cell.
+    if(e.altKey){const s=editor.selectionStart,t=editor.value;editor.value=t.slice(0,s)+'\n'+t.slice(editor.selectionEnd);editor.setSelectionRange(s+1,s+1);placeEditor();$('cellValue').textContent=editor.value;return;}
+    commitEditor(e.ctrlKey||(isMac&&e.metaKey));return;
+  }
+  // F4 fixes the reference under the caret (only when the caret sits on a reference).
+  if(e.key==='F4'){e.preventDefault();const r=cycleReference(editor.value.toUpperCase(),editor.selectionStart);if(r){editor.value=r.text;editor.setSelectionRange(r.caret,r.caret);$('cellValue').textContent=r.text;}return;}
+});
+editor.addEventListener('input',()=>{$('cellValue').textContent=editor.value;placeEditor();});
+editor.addEventListener('blur',()=>{if(editing)setTimeout(()=>{if(editing&&document.activeElement!==editor)closeEditor(false);},0);});
+
 function renderHint(){
   $('hintText').textContent=forPlatform(S.hints[hintIndex]);$('hintBack').disabled=hintIndex===0;
   $('hintNext').innerHTML=hintIndex===2?'試してみる <span>↗</span>':'次の手掛かり <span>→</span>';
-  const diagram=$('hintKeys'),el=(tag,text,cls)=>{const n=document.createElement(tag);n.textContent=text;if(cls)n.className=cls;return n;};
+  const diagram=$('hintKeys'),mk=(tag,text,cls)=>{const n=document.createElement(tag);n.textContent=text;if(cls)n.className=cls;return n;};
   diagram.replaceChildren();
-  S.keys.forEach((combo,i)=>{if(i)diagram.append(el('span','›','sep'));combo.forEach((k,j)=>{if(j)diagram.append(el('span','＋'));diagram.append(el('kbd',forPlatform(k)));});});
+  S.keys.forEach((combo,i)=>{if(i)diagram.append(mk('span','›','sep'));combo.forEach((k,j)=>{if(j)diagram.append(mk('span','＋'));diagram.append(mk('kbd',forPlatform(k)));});});
   diagram.classList.toggle('compact',S.keys.flat().length>2);diagram.hidden=hintIndex!==2;
   Array.from($('hintProgress').children).forEach((e,i)=>e.classList.toggle('active',i<=hintIndex));
 }
 function openDialog(dialog){held.clear();$('focusNotice').hidden=true;dialog.showModal();}
 function closeDialog(dialog){
   dialog.close();held.clear();
+  if(editing){editor.focus({preventScroll:true});return;}
+  if(panel){panelEl.querySelector('input,button')?.focus({preventScroll:true});return;}
   if(state.phase==='ready')$('startBtn').focus({preventScroll:true});
   else if(state.phase==='playing'||(state.phase==='failed'&&$('resultScreen').hidden))focusGame();
   else if(!$('resultScreen').hidden)$(!$('nextBtn').hidden?'nextBtn':'retryBtn').focus({preventScroll:true});
@@ -503,35 +742,69 @@ $('soundBtn').addEventListener('click',()=>setSound(!sound));$('soundToggle').ad
 $('motionToggle').addEventListener('change',e=>{reduced=e.target.checked;settingsUI();persistSettings();});
 $('fullscreenBtn').addEventListener('click',async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await $('gameShell').requestFullscreen();}catch{announce('この環境では全画面にできません。');}});
 if(!document.fullscreenEnabled)$('fullscreenBtn').hidden=true;
-canvas.addEventListener('pointerdown',()=>{if(state.phase==='playing'&&!isModal())focusGame();});
+canvas.addEventListener('pointerdown',()=>{if(state.phase==='playing'&&!isModal()&&!panel)focusGame();});
+// Board keys. Letters are read from e.code so ⌥ and keyboard layouts do not change them;
+// when a device sends no code, the key itself is used instead.
+const codeOf=e=>e.code||(/^[a-z]$/i.test(e.key)?`Key${e.key.toUpperCase()}`:/^[0-9]$/.test(e.key)?`Digit${e.key}`:e.key==='!'?'Digit1':e.key===' '?'Space':'');
+function boardKey(e){
+  const code=codeOf(e), mod=e.ctrlKey||(isMac&&e.metaKey), shift=e.shiftKey, alt=e.altKey, k=e.key;
+  const once=f=>{e.preventDefault();if(!e.repeat)f();return true;};
+  if(state.panel)return false;
+  if(k==='Escape'){if(state.clipboard){e.preventDefault();act(cancelClipboard(state),'clip');}return true;}
+  if(k==='F2'&&!mod&&!alt)return once(()=>shift?(S.notes[key(state.position)]?openPanel('note'):null):(()=>{const v=state.values[key(state.position)];openEditor(isFormula(v)?v.f:rawText(v));})());
+  if(k==='F11'&&shift&&!mod)return once(()=>act(newSheet(state),'sheet'));
+  if(k==='Delete'&&!mod)return once(()=>{if(!act(clearContents(state),'delete')&&S.locked.has(key(state.position)))act(state,'locked');});
+  if(k==='Backspace'&&!mod)return once(()=>openEditor(''));
+  if(code==='Space'&&mod&&!shift)return once(()=>act(selectColumn(state),'select'));
+  if(code==='Space'&&shift&&!mod)return once(()=>act(selectRow(state),'select'));
+  if(mod&&alt&&code==='KeyV')return once(()=>{if(state.clipboard?.mode==='copy')openPanel('pasteSpecial');});
+  if(mod&&shift&&code==='KeyL')return once(()=>act(toggleFilter(state),'filter'));
+  if(mod&&shift&&code==='Digit1')return once(()=>act(numberFormat(state),'format'));
+  if(alt&&!mod&&k==='ArrowDown'&&state.filter&&S.filter&&same(state.position,S.filter.header))return once(()=>openPanel('filter'));
+  if(mod&&!alt&&!shift){
+    const cmd={KeyC:()=>act(copy(state),'clip'),KeyX:()=>act(cut(state),'clip'),KeyV:()=>act(paste(state),'paste'),KeyZ:()=>act(undo(state),'undo'),
+      KeyD:()=>act(fill(state,'down'),'fill'),KeyR:()=>act(fill(state,'right'),'fill'),KeyF:()=>openPanel('find'),KeyH:()=>openPanel('replace'),KeyG:()=>openPanel('goto'),
+      KeyB:()=>act(toggleBold(state),'format'),KeyA:()=>act(selectRegion(state),'select')}[code];
+    if(cmd)return once(cmd);
+    if(k==='Home')return once(()=>act(goHome(state),'jump'));
+    if(k==='End')return once(()=>act(goEnd(state),'jump'));
+  }
+  return false;
+}
 document.addEventListener('keydown',e=>{
   const key=e.key.toLowerCase(), mod=e.ctrlKey||(isMac&&e.metaKey);
   if(isModal())return;
+  // Esc closes an in-game panel even before focus has reached it.
+  if(panel&&e.key==='Escape'){e.preventDefault();closePanel();return;}
   const target=e.target;
   if(target instanceof HTMLElement&&(target.matches('input,textarea,select')||target.isContentEditable))return;
+  if(panel&&panelEl.contains(target))return;
   if(state.phase==='ready')return;
   if(state.phase==='failed'||state.phase==='won'){
     if((key==='r'||key==='enter')&&!mod&&!e.altKey){e.preventDefault();if(!e.repeat&&!held.has(e.code)){held.add(e.code);if(key==='enter'&&state.phase==='won'&&hasNext())enterRoom(room+1);else retry();}}return;
   }
   if(document.activeElement!==canvas||!inputArmed)return;
+  // Ctrl+R is "fill right", so modified keys are read before the plain R retry.
+  if(boardKey(e))return;
   if(key==='r'&&!mod&&!e.altKey){e.preventDefault();if(!e.repeat)retry();return;}
-  if(key==='escape'){if(state.clipboard){e.preventDefault();act(cancelClipboard(state),'clip');}return;}
-  if(mod&&!e.altKey&&!e.shiftKey&&(key==='c'||key==='x'||key==='v')){
-    e.preventDefault();if(e.repeat)return;
-    act(key==='c'?copy(state):key==='x'?cut(state):paste(state),key==='v'?'paste':'clip');return;
-  }
   const dirs={arrowright:[1,0],arrowleft:[-1,0],arrowup:[0,-1],arrowdown:[0,1]};
-  if(!dirs[key])return;
-  e.preventDefault();if(e.repeat||held.has(e.code)||e.altKey)return;
-  held.add(e.code);const [dx,dy]=dirs[key];
-  if(e.shiftKey)act(extend(state,dx,dy,mod),'select');else act(move(state,dx,dy,mod),'move',dx,dy);
+  if(dirs[key]){
+    e.preventDefault();if(e.repeat||held.has(e.code)||e.altKey||state.panel)return;
+    held.add(e.code);const [dx,dy]=dirs[key];
+    if(e.shiftKey)act(extend(state,dx,dy,mod),'select');else act(move(state,dx,dy,mod),'move',dx,dy);
+    return;
+  }
+  // Any other printable key starts typing into the cell, replacing what is there.
+  if(e.key.length===1&&!mod&&!e.altKey&&!state.panel){e.preventDefault();openEditor(e.key);}
 });
 // macOS does not send keyup for other keys while ⌘ is down, so releasing ⌘ frees them all.
 document.addEventListener('keyup',e=>{held.delete(e.code);if(e.key==='Meta')held.clear();});
-window.addEventListener('blur',()=>{held.clear();inputArmed=false;if(state.phase==='playing'&&!isModal())$('focusNotice').hidden=false;});
+window.addEventListener('blur',()=>{held.clear();inputArmed=false;if(state.phase==='playing'&&!isModal()&&!panel&&!editing)$('focusNotice').hidden=false;});
 document.addEventListener('visibilitychange',()=>{if(document.hidden){held.clear();inputArmed=false;}});
 document.addEventListener('focusin',()=>{
-  clearTimeout(focusTimer);focusTimer=setTimeout(()=>{if(state.phase==='playing'&&!isModal())$('focusNotice').hidden=document.activeElement===canvas;},0);
+  clearTimeout(focusTimer);focusTimer=setTimeout(()=>{if(state.phase==='playing'&&!isModal()&&!panel&&!editing)$('focusNotice').hidden=document.activeElement===canvas;},0);
 });
+// ?debug exposes the live state for manual checks; nothing in the game reads it.
+if(new URLSearchParams(location.search).has('debug'))window.__game={get state(){return state;},get held(){return [...held];},get inputArmed(){return inputArmed;}};
 new ResizeObserver(resize).observe(canvas);
 applyRoom();settingsUI();sync();$('startBtn').focus({preventScroll:true});requestAnimationFrame(frame);
