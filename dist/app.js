@@ -21,7 +21,7 @@ let progress = (() => { const n = safeRead('cell-escape.progress', null); if (Nu
 let room = (() => { const q = Number(new URLSearchParams(location.search).get('room')); return q >= 1 && q <= STAGES.length ? q - 1 : Math.min(progress, STAGES.length - 1); })();
 let S = STAGES[room];
 let state = createState(room);
-let highestHint = 0, hintIndex = 0, inputArmed = false;
+let hintIndex = 0, inputArmed = false;
 let width = 0, height = 0, scale = 1, geo = null, audio = null;
 let animation = null, particles = [], trapFx = null, bump = null, pendingDeath = false, doorK = null;
 let panel = null, editing = null;
@@ -38,6 +38,29 @@ const LASER_LOOK = 450, CHANGE_LOOK = 260;
 const IMPACT_SOUND = { ceilingPress: 'press', doorDrop: 'press', fakeDoor: 'press', floorDrop: 'drop', fakeExit: 'drop', spikes: 'spike', laser: 'laser', blast: 'drop' };
 const ORDINALS = ['FIRST','SECOND','THIRD','FOURTH','FIFTH','SIXTH','SEVENTH','EIGHTH','NINTH','TENTH','ELEVENTH','TWELFTH','THIRTEENTH','FOURTEENTH','FIFTEENTH','SIXTEENTH','SEVENTEENTH','EIGHTEENTH','NINETEENTH','TWENTIETH','21ST','22ND','23RD','24TH','25TH','26TH','27TH','28TH','29TH','LAST'];
 const pad = n => String(n).padStart(2, '0');
+// What each shortcut does, shown on the clear screen (keys are the room's hint keys joined with ＋).
+const KEY_HELP = {
+  'Ctrl＋→':'データの端まで一気に移動','Ctrl＋↓':'下のデータの端まで移動','Ctrl＋Shift＋→':'データの端まで選択を広げる',
+  'Ctrl＋C':'コピー','Ctrl＋V':'貼り付け','Ctrl＋X':'切り取り（貼り付けたときに元が消える）','Esc':'ダイアログを閉じる・取り消す',
+  'Ctrl＋Z':'元に戻す','Ctrl＋Y':'やり直す（元に戻したものをもう一度）','Delete':'セルの中身だけを消す','F2':'中身を残したままセルを編集',
+  'Backspace':'1文字消す','Enter':'確定して下のセルへ','Alt＋Enter':'セルの中で改行','Shift＋→':'選択を1セルずつ広げる',
+  'Shift＋↓':'選択を1行広げる','Shift＋↑':'選択を上へ広げる','Ctrl＋Space':'列全体を選択','Shift＋Space':'行全体を選択',
+  'Ctrl＋A':'いまの表（現在の領域）を選択。もう一度でシート全体','Ctrl＋Enter':'選んだセル全部に同じ値を入力',
+  'Ctrl＋D':'一番上のセルを下へコピー','Ctrl＋R':'一番左のセルを右へコピー','Ctrl＋F':'検索','Ctrl＋H':'置換（範囲を選ぶとその中だけ）',
+  'Ctrl＋G':'指定したセルへジャンプ','Ctrl＋Home':'A1へ移動','Ctrl＋End':'使っている範囲の右下へ移動',
+  'Ctrl＋Shift＋L':'フィルターのオン・オフ','Alt＋↓':'フィルターのメニューを開く','Ctrl＋Alt＋V':'形式を選択して貼り付け',
+  'V':'（形式を選択して貼り付けで）値だけ','T':'（形式を選択して貼り付けで）書式だけ','F':'（形式を選択して貼り付けで）数式だけ',
+  'Ctrl＋Shift＋1':'桁区切り・小数2桁の数値表示','Ctrl＋B':'太字','Shift＋F2':'セルのメモを開く','F4':'式の参照を固定する（$を付ける）',
+  'Shift＋F11':'新しいシートを挿入','F8':'選択の拡張モード（矢印だけで広げる）','Shift＋F8':'選択の追加モード（離れた範囲も一緒に選ぶ）',
+  'Ctrl＋Shift＋Home':'A1まで選択','Ctrl＋Shift＋End':'使っている範囲の右下まで選択','Tab':'確定して右へ（保護シートでは次の入力欄へ）',
+  'Shift＋Tab':'前の入力欄へ','Shift＋Enter':'確定して上のセルへ','Ctrl＋Shift＋+':'セルを挿入（後ろを押し出す）','Ctrl＋-':'セルを削除（後ろを詰める）',
+  'Alt＋=':'合計（SUM）の式を入れる','Ctrl＋`':'セルに数式を表示する','Ctrl＋;':'今日の日付を入力','Ctrl＋PageDown':'次のシートへ','Ctrl＋PageUp':'前のシートへ',
+  'Ctrl＋E':'フラッシュフィル（例から残りを埋める）','Ctrl＋T':'テーブルを作る','F9':'再計算','Alt＋F1':'グラフを作る','Shift＋F10':'右クリックメニューを開く',
+  'Ctrl＋I':'斜体','Ctrl＋U':'下線','Ctrl＋5':'取り消し線','Ctrl＋Shift＋0':'列の再表示','Ctrl＋Shift＋9':'行の再表示','Ctrl＋9':'行を隠す','Ctrl＋0':'列を隠す',
+  'Ctrl＋S':'上書き保存','F12':'名前を付けて保存','1':'数字を入力','3':'数字を入力',
+};
+// Hints open one at a time: one per death in this room, up to the third (the answer).
+const unlockedHints = () => Math.min(3, state.deaths);
 // Hints are written with Windows key names everywhere (on a Mac, ⌘ is still accepted wherever Ctrl is).
 const forPlatform = text => text;
 const seenKey = p => `${room}:${key(p)}`;
@@ -571,6 +594,8 @@ function sync(){
   $('sheetStatus').textContent=pendingDeath?'IN THE ROOM':state.phase==='playing'&&stale?'CALCULATE':state.phase==='playing'&&state.mode?{extend:'EXTEND',add:'ADD TO SELECTION'}[state.mode]:{ready:'READY',playing:'IN THE ROOM',failed:'CAUGHT',won:'ESCAPED'}[state.phase];
   $('fileName').textContent=state.book?`${state.book}.xlsx${state.dirty?' ●':''}`:`room_${pad(S.number)}.xlsx`;
   $('startScreen').hidden=state.phase!=='ready';
+  const open=unlockedHints();if(open)$('hintBtn').dataset.count=String(open);else delete $('hintBtn').dataset.count;
+  $('hintBtn').setAttribute('aria-label',open?`ヒントを開く（${open}つ開いている）`:'ヒント（まだ開いていない）');
   // Panels sit on the half of the board away from the character, so the cell they act on stays visible.
   panelEl.classList.toggle('low',state.position.row<=Math.ceil(S.visibleRows/2));
   if(state.panel?.kind==='confirm'&&panel?.kind!=='confirm')openPanel('confirm');
@@ -604,7 +629,7 @@ function applyRoom(){
 }
 function enterRoom(i){
   if(isModal())return;
-  cancelAttempt();room=i;state=createState(i);highestHint=0;hintIndex=0;$('resultScreen').hidden=true;
+  cancelAttempt();room=i;state=createState(i);hintIndex=0;$('resultScreen').hidden=true;
   applyRoom();sync();$('startBtn').focus({preventScroll:true});
 }
 function start(){cancelAttempt();$('resultScreen').hidden=true;state=begin(state);sync();focusGame();audioReady();}
@@ -615,11 +640,16 @@ function showResult(){
   closePanel(false);closeEditor(false);
   result.className=`result-screen screen ${won?'won':'failed'}`;
   $('resultKicker').textContent=won?'ESCAPED':'TRY AGAIN';$('resultTitle').textContent=won?'抜け出した。':'やられた。';
-  $('resultSubtitle').textContent=won?(hasNext()?'扉の向こうに、たどり着いた。':'最後の扉を、抜けた。'):'';$('resultSubtitle').hidden=!won;
+  // A death that opens a new hint says so; the hint itself stays behind the ? button.
+  const opened=!won&&state.deaths>=1&&state.deaths<=3;
+  $('resultSubtitle').textContent=won?(hasNext()?'扉の向こうに、たどり着いた。':'最後の扉を、抜けた。'):opened?`手掛かりがひとつ開いた（右上の ? ・${state.deaths}/3）`:'';$('resultSubtitle').hidden=!won&&!opened;
+  // Cleared: the shortcuts this room used, and what each one does.
+  $('clearKeys').hidden=!won;
+  if(won)$('clearKeys').replaceChildren(...S.keys.map(combo=>{const k=combo.join('＋'),li=document.createElement('li'),kbd=document.createElement('span'),txt=document.createElement('span');kbd.className='ck-key';kbd.textContent=k;txt.textContent=KEY_HELP[k]||'';li.append(kbd,txt);return li;}));
   $('nextBtn').hidden=!next;$('retryBtn').hidden=next;$('resultKey').textContent=next?'ENTER で次へ · R でもう一度':'ENTER / R';
   // The last room: ALL CLEAR, with every room and the shortcuts it used.
   const all=won&&!hasNext();result.classList.toggle('all-clear',all);$('allClear').hidden=!all;
-  if(all){$('resultKicker').textContent='ALL CLEAR';$('resultTitle').textContent='ぜんぶ、抜け出した。';$('resultSubtitle').textContent='50の部屋で使ったショートカット';
+  if(all){$('clearKeys').hidden=true;$('resultKicker').textContent='ALL CLEAR';$('resultTitle').textContent='ぜんぶ、抜け出した。';$('resultSubtitle').textContent='50の部屋で使ったショートカット';
     $('allClear').replaceChildren(...STAGES.map(st=>{const li=document.createElement('li');const name=document.createElement('span');name.className='ac-room';name.textContent=`${pad(st.number)} ${st.title}`;
       const keys=document.createElement('span');keys.className='ac-keys';keys.textContent=st.keys.map(c=>c.join('＋')).join(' › ');li.append(name,keys);return li;}));}
   result.hidden=false;
@@ -813,13 +843,16 @@ editor.addEventListener('input',()=>{$('cellValue').textContent=editor.value;pla
 editor.addEventListener('blur',()=>{if(editing)setTimeout(()=>{if(editing&&document.activeElement!==editor)closeEditor(false);},0);});
 
 function renderHint(){
-  $('hintText').textContent=forPlatform(S.hints[hintIndex]);$('hintBack').disabled=hintIndex===0;
-  $('hintNext').innerHTML=hintIndex===2?'試してみる <span>↗</span>':'次の手掛かり <span>→</span>';
+  const open=unlockedHints();hintIndex=Math.min(hintIndex,Math.max(0,open-1));
+  $('hintText').textContent=open?forPlatform(S.hints[hintIndex]):'まだ手掛かりはない。\n一度やられるたびに、ひとつずつ開く。';$('hintBack').disabled=hintIndex===0||!open;
+  const nextLocked=open&&hintIndex<2&&hintIndex>=open-1;
+  $('hintNext').innerHTML=!open||hintIndex===2||nextLocked?'試してみる <span>↗</span>':'次の手掛かり <span>→</span>';
+  $('hintLock').textContent=nextLocked||!open?`次の手掛かりは、あと${(open?hintIndex+2:1)-state.deaths}回やられると開く。`:'';
   const diagram=$('hintKeys'),mk=(tag,text,cls)=>{const n=document.createElement(tag);n.textContent=text;if(cls)n.className=cls;return n;};
   diagram.replaceChildren();
   S.keys.forEach((combo,i)=>{if(i)diagram.append(mk('span','›','sep'));combo.forEach((k,j)=>{if(j)diagram.append(mk('span','＋'));diagram.append(mk('kbd',forPlatform(k)));});});
-  diagram.classList.toggle('compact',S.keys.flat().length>2);diagram.hidden=hintIndex!==2;
-  Array.from($('hintProgress').children).forEach((e,i)=>e.classList.toggle('active',i<=hintIndex));
+  diagram.classList.toggle('compact',S.keys.flat().length>2);diagram.hidden=hintIndex!==2||open<3;
+  Array.from($('hintProgress').children).forEach((e,i)=>{e.classList.toggle('active',open>0&&i<=hintIndex);e.classList.toggle('locked',i>=open);});
 }
 function openDialog(dialog){held.clear();$('focusNotice').hidden=true;dialog.showModal();}
 function closeDialog(dialog){
@@ -832,9 +865,9 @@ function closeDialog(dialog){
 }
 $('startBtn').addEventListener('click',start);$('retryBtn').addEventListener('click',retry);$('resumeBtn').addEventListener('click',focusGame);
 $('nextBtn').addEventListener('click',()=>{if(hasNext())enterRoom(room+1);});
-$('hintBtn').addEventListener('click',()=>{hintIndex=highestHint;renderHint();openDialog(hintDialog);});
+$('hintBtn').addEventListener('click',()=>{hintIndex=Math.max(0,unlockedHints()-1);renderHint();openDialog(hintDialog);});
 $('hintBack').addEventListener('click',()=>{hintIndex=Math.max(0,hintIndex-1);renderHint();});
-$('hintNext').addEventListener('click',()=>{if(hintIndex===2){closeDialog(hintDialog);return;}highestHint=Math.max(highestHint,++hintIndex);renderHint();});
+$('hintNext').addEventListener('click',()=>{if(hintIndex>=unlockedHints()-1){closeDialog(hintDialog);return;}hintIndex++;renderHint();});
 $('settingsBtn').addEventListener('click',()=>{settingsUI();openDialog(settingsDialog);});
 $('settingsDone').addEventListener('click',()=>closeDialog(settingsDialog));
 for(const dialog of [hintDialog,settingsDialog]){
