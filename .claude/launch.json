@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "cell-escape", "runtimeExecutable": "python3", "runtimeArgs": ["-m", "http.server", "8000", "--directory", "dist"], "port": 8000 }
+  ]
+}
