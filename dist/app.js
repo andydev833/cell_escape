@@ -1,7 +1,10 @@
 import { STAGES, stageOf, createState, begin, restart, move, extend, copy, cut, paste, cancelClipboard, cellName, key, fromKey, parseCell, parseRef,
   tokenOf, isBlank, isFormula, deviceStatus, exitOpen, selectionRect, countTokens, test, displayValue, rawText, canEdit, commitEdit,
   clearContents, undo, fill, selectColumn, selectRow, selectRegion, jumpTo, goHome, goEnd, findNext, replaceAll, toggleFilter,
-  applyFilter, filterChoices, numberFormat, toggleBold, answerConfirm, newSheet, cycleReference, hiddenSet, gotoRef, MAX_ROW, MAX_COL } from './engine.js';
+  applyFilter, filterChoices, numberFormat, toggleBold, answerConfirm, newSheet, cycleReference, hiddenSet, gotoRef, MAX_ROW, MAX_COL,
+  rootOf, sheetNames, selectionAreas, widthOf, DEFAULT_WIDTH, hiddenColSet, redo, toggleExtend, toggleAdd, clearModes, selectTo, tabMove,
+  insertCells, deleteCells, wholeRows, wholeCols, autoSumText, flashFill, toggleFormulaView, toggleStyle, recalc, createTable, tableRange,
+  addChart, hideRows, hideCols, unhideRows, unhideCols, switchSheet, save, saveAs, serialText, valueOf } from './engine.js';
 
 const $ = id => document.getElementById(id);
 const canvas = $('board'), ctx = canvas.getContext('2d');
@@ -35,8 +38,8 @@ const LASER_LOOK = 450, CHANGE_LOOK = 260;
 const IMPACT_SOUND = { ceilingPress: 'press', doorDrop: 'press', fakeDoor: 'press', floorDrop: 'drop', fakeExit: 'drop', spikes: 'spike', laser: 'laser', blast: 'drop' };
 const ORDINALS = ['FIRST','SECOND','THIRD','FOURTH','FIFTH','SIXTH','SEVENTH','EIGHTH','NINTH','TENTH','ELEVENTH','TWELFTH','THIRTEENTH','FOURTEENTH','FIFTEENTH','SIXTEENTH','SEVENTEENTH','EIGHTEENTH','NINETEENTH','TWENTIETH','21ST','22ND','23RD','24TH','25TH','26TH','27TH','28TH','29TH','LAST'];
 const pad = n => String(n).padStart(2, '0');
-// Mac: ⌘ stands in for Ctrl, except where macOS owns ⌘ (⌘Space, ⌘H) and the room asks for ⌃ instead.
-const forPlatform = text => !isMac ? text : text.replaceAll('Ctrl', S.macCtrl ? '⌃' : '⌘').replaceAll('Alt', '⌥');
+// Hints are written with Windows key names everywhere (on a Mac, ⌘ is still accepted wherever Ctrl is).
+const forPlatform = text => text;
 const seenKey = p => `${room}:${key(p)}`;
 const same = (a, b) => a && b && a.col === b.col && a.row === b.row;
 
@@ -44,18 +47,22 @@ function rounded(x,y,w,h,r,fill,stroke) {
   ctx.beginPath(); ctx.roundRect(x,y,w,h,r); if(fill){ctx.fillStyle=fill;ctx.fill();} if(stroke){ctx.strokeStyle=stroke;ctx.stroke();}
 }
 // Filtered rows take no space, so the grid keeps only the rows that are shown.
+// Filtered or hidden rows take no space; columns take their width (hidden ones none).
 function computeGeometry() {
   const gutter = width < 500 ? 23 : 31, top = 27, hidden = hiddenSet(state), rows = [];
   for (let r = 1; r <= S.visibleRows; r++) if (!hidden.has(r)) rows.push(r);
-  const cw = (width - gutter - 15) / S.visibleCols, ch = (height - top - 17) / Math.max(rows.length, 1);
-  geo = { gutter, top, cw, ch, rows, rowIdx: new Map(rows.map((r, i) => [r, i])) };
+  const widths = [0]; for (let c = 1; c <= S.visibleCols; c++) widths.push(widthOf(state, c));
+  const unit = (width - gutter - 15) / widths.reduce((a, b) => a + b, 0), colLeft = [gutter], colW = [0];
+  for (let c = 1; c <= S.visibleCols + 1; c++) { colW[c] = (widths[c] ?? DEFAULT_WIDTH) * unit; colLeft[c] = c === 1 ? gutter : colLeft[c - 1] + colW[c - 1]; }
+  const cw = unit * DEFAULT_WIDTH, ch = (height - top - 17) / Math.max(rows.length, 1);
+  geo = { gutter, top, cw, ch, rows, rowIdx: new Map(rows.map((r, i) => [r, i])), colLeft, colW };
 }
-const shown = p => p.col >= 1 && p.col <= S.visibleCols && geo.rowIdx.has(p.row);
+const shown = p => p.col >= 1 && p.col <= S.visibleCols && geo.colW[p.col] > 0 && geo.rowIdx.has(p.row);
 function point(p) {
-  const i = geo.rowIdx.get(p.row);
-  return { x: geo.gutter + (p.col - .5)*geo.cw, y: geo.top + ((i ?? (p.row > S.visibleRows ? geo.rows.length + 1 : -1)) + .5)*geo.ch };
+  const i = geo.rowIdx.get(p.row), c = Math.min(p.col, S.visibleCols + 1);
+  return { x: p.col > S.visibleCols ? width - 8 : geo.colLeft[c] + geo.colW[c]/2, y: geo.top + ((i ?? (p.row > S.visibleRows ? geo.rows.length + 1 : -1)) + .5)*geo.ch };
 }
-function cellBox(p) { const c = point(p); return { x: c.x - geo.cw/2, y: c.y - geo.ch/2, w: geo.cw, h: geo.ch }; }
+function cellBox(p) { const c = point(p); const w = geo.colW[Math.min(p.col, S.visibleCols)] || geo.cw; return { x: c.x - w/2, y: c.y - geo.ch/2, w, h: geo.ch }; }
 // Shared by floors, the character and every trap so they always meet at the same height.
 function at(p) {
   const { cw, ch } = geo, c = point(p), floorHeight = Math.min(ch*.7,36), size = Math.min(cw*.43,ch*.83,29);
@@ -235,7 +242,13 @@ function drawSeal(x,y,r) {
   ctx.fillStyle='#a8322b';ctx.beginPath();for(let i=0;i<10;i++){const a=i/10*Math.PI*2,rr=i%2?r*.85:r;ctx.lineTo(x+Math.cos(a)*rr,y+Math.sin(a)*rr);}ctx.fill();
   ctx.fillStyle='#d9594c';ctx.beginPath();ctx.arc(x,y,r*.55,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#7a1f1a';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x-r*.25,y);ctx.lineTo(x+r*.25,y);ctx.moveTo(x,y-r*.25);ctx.lineTo(x,y+r*.25);ctx.stroke();
 }
+function drawEye(x,y,r,awake) {
+  ctx.save();ctx.beginPath();ctx.ellipse(x,y,r*1.2,r*.7,0,0,Math.PI*2);ctx.fillStyle='#f3efe0';ctx.fill();ctx.strokeStyle=awake?'#e0584e':'#55684a';ctx.lineWidth=1.5;ctx.stroke();
+  if(awake){ctx.fillStyle='#c0392b';ctx.beginPath();ctx.arc(x,y,r*.42,0,Math.PI*2);ctx.fill();}else{ctx.strokeStyle='#55684a';ctx.beginPath();ctx.moveTo(x-r,y);ctx.lineTo(x+r,y);ctx.stroke();}
+  ctx.restore();
+}
 function drawTokenIcon(token,x,y,r,color) {
+  if(token==='eye'){drawEye(x,y,r,true);return;}
   if(token==='seal'){drawSeal(x,y,r);return;}
   if(token==='core'){ctx.save();if(!reduced){ctx.shadowColor='#bfe08a';ctx.shadowBlur=8;}ctx.fillStyle=color||'#cde7a0';ctx.beginPath();ctx.moveTo(x,y-r);ctx.lineTo(x+r*.8,y);ctx.lineTo(x,y+r);ctx.lineTo(x-r*.8,y);ctx.closePath();ctx.fill();ctx.restore();ctx.strokeStyle='#3b4a2c';ctx.lineWidth=1;ctx.stroke();return;}
   if(token==='stone')drawStone(x,y,r);
@@ -266,15 +279,18 @@ function drawMonitor(rule) {
   const slots = Math.max(rule.limit,count), r = Math.min(h*.2,w/(slots*3.2));
   for(let i=0;i<slots;i++)drawTokenIcon(rule.token,x+w*(i+.5)/slots,c.y,r,i<count?(alarm?'#ff6a54':'#b9df8f'):'#33452f');
 }
-function drawCellText(p,text,{bold=false,fill=null}={}) {
+const FILLS={red:['#b8453a40','#d0614f'],green:['#3f8a4a40','#6fbf6a']};
+function drawCellText(p,text,f={}) {
   const b=cellBox(p), floor=S.floor.has(key(p)), L=at(p);
-  if(fill==='red'){rounded(b.x+3,b.y+3,b.w-6,b.h-6,3,'#b8453a40','#d0614f');}
+  if(FILLS[f.fill])rounded(b.x+3,b.y+3,b.w-6,b.h-6,3,...FILLS[f.fill]);
   const lines=String(text).split('\n'), size=Math.max(8,Math.min(11,geo.cw*.15));
-  ctx.font=`${bold?'800 ':''}${size}px ui-monospace,Consolas,monospace`;ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.font=`${f.italic?'italic ':''}${f.bold?'800 ':''}${size}px ui-monospace,Consolas,monospace`;ctx.textAlign='center';ctx.textBaseline='middle';
   ctx.fillStyle=text==='1'?'#9eaf7740':'#d6e3c3';
   const y0=floor?L.floorY+L.floorHeight*.14-(lines.length-1)*size*.55:L.floorY-(lines.length-1)*size*.55;
   ctx.save();ctx.beginPath();ctx.rect(b.x+1,b.y,b.w-2,b.h);ctx.clip();
-  lines.forEach((line,i)=>{ctx.fillText(line,L.x-(floor&&text!=='1'?0:0),y0+i*size*1.1);if(bold){ctx.fillText(line,L.x+.6,y0+i*size*1.1);}});
+  lines.forEach((line,i)=>{const y=y0+i*size*1.1;ctx.fillText(line,L.x,y);if(f.bold)ctx.fillText(line,L.x+.6,y);
+    const w=ctx.measureText(line).width;
+    if(f.underline){ctx.fillRect(L.x-w/2,y+size*.55,w,1.2);}if(f.strike){ctx.fillRect(L.x-w/2,y-.5,w,1.2);}});
   ctx.restore();
 }
 function draw(t) {
@@ -292,12 +308,16 @@ function draw(t) {
   gradient.addColorStop(0,'#26392470');gradient.addColorStop(1,'#101a1300');ctx.fillStyle=gradient;ctx.fillRect(0,0,width,height);
   ctx.fillStyle='#1d291d';ctx.fillRect(0,0,width,top);ctx.fillRect(0,0,gutter,height);
   ctx.strokeStyle='#607c4524';ctx.lineWidth=.7;
-  for(let c=0;c<=S.visibleCols;c++){const x=gutter+c*cw;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,height);ctx.stroke();}
+  for(let c=1;c<=S.visibleCols+1;c++){const x=geo.colLeft[c];ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,height);ctx.stroke();
+    // A hidden column leaves a doubled line where it used to be.
+    if(c<=S.visibleCols&&geo.colW[c]===0){ctx.strokeStyle='#8fb06a66';ctx.beginPath();ctx.moveTo(x+1.5,0);ctx.lineTo(x+1.5,height);ctx.stroke();ctx.strokeStyle='#607c4524';}}
+  ctx.beginPath();ctx.moveTo(gutter,0);ctx.lineTo(gutter,height);ctx.stroke();
   for(let i=0;i<=geo.rows.length;i++){const y=top+i*ch;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(width,y);ctx.stroke();
     // Hidden rows leave a doubled line, like a filtered sheet.
     if(i>0&&i<geo.rows.length&&geo.rows[i]-geo.rows[i-1]>1){ctx.strokeStyle='#8fb06a66';ctx.beginPath();ctx.moveTo(0,y+1.5);ctx.lineTo(width,y+1.5);ctx.stroke();ctx.strokeStyle='#607c4524';}}
   ctx.font=`${width<500?8:9}px ui-monospace,Consolas,monospace`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle='#6d8659';
-  for(let c=1;c<=S.visibleCols;c++)ctx.fillText(String.fromCharCode(64+c),gutter+(c-.5)*cw,top*.5);
+  for(let c=1;c<=S.visibleCols;c++)if(geo.colW[c]>0)ctx.fillText(String.fromCharCode(64+c),geo.colLeft[c]+geo.colW[c]/2,top*.5);
+  if(state.chartView!==null){drawChartSheet(t);if(shaking)ctx.restore();return;}
   geo.rows.forEach((r,i)=>ctx.fillText(String(r),gutter*.5,top+(i+.5)*ch));
 
   const floorCells=[...S.floor].map(fromKey).filter(shown);
@@ -351,7 +371,7 @@ function draw(t) {
     if(S.floor.has(key(c)))return;
     const lit=status[d.id].lit[i];
     if(shown(c)){const b=cellBox(c);rounded(b.x+b.w*.28,b.y+b.h*.25,b.w*.44,b.h*.5,3,lit?'#5d6f3c':'#23301f',lit?'#f2d27e':'#6f8659');drawLamp(b.x+b.w/2,b.y+b.h/2,lit);}
-    else if(c.row>S.visibleRows&&c.col<=S.visibleCols){const x=geo.gutter+(c.col-.5)*cw,y=height-9;ctx.fillStyle=lit?'#f2d27e':'#8fa27a';ctx.beginPath();ctx.moveTo(x-6,y-5);ctx.lineTo(x+6,y-5);ctx.lineTo(x,y+3);ctx.fill();}
+    else if(c.row>S.visibleRows&&c.col<=S.visibleCols){const x=point(c).x,y=height-9;ctx.fillStyle=lit?'#f2d27e':'#8fa27a';ctx.beginPath();ctx.moveTo(x-6,y-5);ctx.lineTo(x+6,y-5);ctx.lineTo(x,y+3);ctx.fill();}
     else if(c.col>S.visibleCols&&geo.rowIdx.has(c.row)){const y=point({col:1,row:c.row}).y,x=width-8;ctx.fillStyle=lit?'#f2d27e':'#8fa27a';ctx.beginPath();ctx.moveTo(x-5,y-6);ctx.lineTo(x-5,y+6);ctx.lineTo(x+3,y);ctx.fill();}
   });
   // Red sensors react to being selected.
@@ -362,19 +382,28 @@ function draw(t) {
       ctx.strokeStyle=solved?'#f2d27e99':'#8fa27a66';ctx.setLineDash([2,2]);ctx.strokeRect(b.x+4,b.y+5,b.w-8,b.h-10);ctx.setLineDash([]);
       // Shrink the lettering until the longest line fits the plate.
       let size=Math.max(9,Math.min(13,cw*.2));ctx.font=`600 ${size}px Georgia,serif`;const widest=Math.max(...lines.map(l=>ctx.measureText(l).width));if(widest>b.w-12){size*=(b.w-12)/widest;ctx.font=`600 ${size}px Georgia,serif`;}
-      ctx.fillStyle=solved?'#f2d27e':'#a8bd92';ctx.textAlign='center';ctx.textBaseline='middle';const lh=size*1.15;lines.forEach((line,k)=>ctx.fillText(line,b.x+b.w/2,b.y+b.h/2+(k-(lines.length-1)/2)*lh));}
+      if(d.style?.italic)ctx.font=`italic 600 ${size}px Georgia,serif`;
+      ctx.fillStyle=solved?'#f2d27e':'#a8bd92';ctx.textAlign='center';ctx.textBaseline='middle';const lh=size*1.15;
+      if(d.style?.underline||d.style?.strike){const w=ctx.measureText(text).width,cy=b.y+b.h/2;ctx.fillRect(b.x+b.w/2-w/2,d.style.underline?cy+size*.55:cy-.5,w,1.3);}lines.forEach((line,k)=>ctx.fillText(line,b.x+b.w/2,b.y+b.h/2+(k-(lines.length-1)/2)*lh));}
+    if(d.today){const b=cellBox(d.at),wide={...b,x:b.x-b.w,w:b.w*2};rounded(wide.x+4,wide.y+6,wide.w-8,wide.h-12,4,'#0e1811','#56704a');ctx.font=`${Math.max(9,Math.min(12,cw*.17))}px ui-monospace,monospace`;ctx.fillStyle='#b9df8f';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(serialText(state.today),wide.x+wide.w/2,wide.y+wide.h/2);}
+    if(d.vault)drawVault(d.at);
+    // The shape the dock accepts: a small table with a header band, in the same colours a real table gets.
+    if(d.tableIcon){const b=cellBox(d.at),x=b.x+4,y=b.y+4,w=b.w*1.6,h=b.h*1.5,rh=h/4;rounded(x,y,w,h,3,'#0e1811','#8fc7d6');ctx.fillStyle='#5aa0b866';ctx.fillRect(x+2,y+2,w-4,rh-2);ctx.strokeStyle='#8fc7d655';for(let i=2;i<4;i++){ctx.beginPath();ctx.moveTo(x+2,y+rh*i);ctx.lineTo(x+w-2,y+rh*i);ctx.stroke();}ctx.beginPath();ctx.moveTo(x+w/2,y+2);ctx.lineTo(x+w/2,y+h-2);ctx.stroke();}
     if(d.door)drawDoor(d.at,{closed:1,style:'closed',lit:false});}
   // Plain cell contents: numbers, words, formulas (their results), formats and notes.
   for(const [k,v] of Object.entries(state.values)){
     const p=fromKey(k);if(!shown(p)||isBlank(v)||tokenOf(v))continue;
-    const f=state.formats[k]||{};drawCellText(p,displayValue(state,p),{bold:f.bold,fill:f.fill});
+    const f=state.formats[k]||{};drawCellText(p,displayValue(state,p),f);
   }
-  for(const [k,f] of Object.entries(state.formats)){const p=fromKey(k);if(shown(p)&&(isBlank(state.values[k])||tokenOf(state.values[k]))&&f.fill){const b=cellBox(p);rounded(b.x+3,b.y+3,b.w-6,b.h-6,3,'#b8453a30','#d0614f');}}
+  for(const [k,f] of Object.entries(state.formats)){const p=fromKey(k);if(shown(p)&&(isBlank(state.values[k])||tokenOf(state.values[k]))&&FILLS[f.fill]){const b=cellBox(p);rounded(b.x+3,b.y+3,b.w-6,b.h-6,3,...FILLS[f.fill]);}}
   // Faint targets the room is waiting for, shown only while the cell is still empty.
   for(const g of S.ghosts)if(shown(g.at)&&isBlank(state.values[key(g.at)])){const b=cellBox(g.at);ctx.strokeStyle='#8fa27a55';ctx.setLineDash([2,3]);ctx.strokeRect(b.x+4,b.y+4,b.w-8,b.h-8);ctx.setLineDash([]);ctx.font=`${Math.max(8,Math.min(11,cw*.15))}px ui-monospace,monospace`;ctx.fillStyle='#9eaf7766';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(g.text,b.x+b.w/2,b.y+b.h/2);}
   for(const k of Object.keys(S.notes)){const p=fromKey(k);if(!shown(p))continue;const b=cellBox(p);ctx.fillStyle='#e0584e';ctx.beginPath();ctx.moveTo(b.x+b.w-1,b.y+1);ctx.lineTo(b.x+b.w-1,b.y+9);ctx.lineTo(b.x+b.w-9,b.y+1);ctx.fill();}
   if(S.filter&&state.filter&&shown(S.filter.header)){const b=cellBox(S.filter.header),s=Math.min(14,b.h*.45),on=!!state.filter.allowed;rounded(b.x+b.w-s-3,b.y+b.h-s-3,s,s,2,on?'#3a5a2e':'#1d2a1b','#8fa27a');ctx.fillStyle=on?'#f2d27e':'#c9d8b5';ctx.beginPath();const cx=b.x+b.w-s/2-3,cy=b.y+b.h-s/2-3;ctx.moveTo(cx-s*.25,cy-s*.12);ctx.lineTo(cx+s*.25,cy-s*.12);ctx.lineTo(cx,cy+s*.18);ctx.fill();}
 
+  // Eyes watch their whole row or column with a red sight line; a hidden row or column closes them.
+  for(const eye of S.eyes||[]){const p=parseCell(eye.at);if(!shown(p))continue;const c=point(p);ctx.save();ctx.strokeStyle='#e0584e88';ctx.lineWidth=2;ctx.setLineDash([6,4]);ctx.lineDashOffset=reduced?0:-t/30;ctx.beginPath();
+    if(eye.watch==='row'){ctx.moveTo(gutter,c.y);ctx.lineTo(width,c.y);}else{ctx.moveTo(c.x,top);ctx.lineTo(c.x,height);}ctx.stroke();ctx.restore();}
   // Exits, fake exits and the lamps that say what the exit still needs.
   const open=exitOpen(S,state);
   if(doorK===null)doorK=open?1:0;
@@ -399,7 +428,15 @@ function draw(t) {
 
   const rect=selectionRect(state), vis={c1:rect.c1,r1:rect.r1,c2:Math.min(rect.c2,S.visibleCols),r2:Math.min(rect.r2,S.visibleRows)};
   const ranged=(state.phase==='playing'||state.phase==='failed')&&(rect.c1!==rect.c2||rect.r1!==rect.r2);
-  const rectBox=r=>{const rs=geo.rows.filter(x=>x>=r.r1&&x<=r.r2);if(!rs.length)return null;const y1=point({col:1,row:rs[0]}).y-ch/2,y2=point({col:1,row:rs[rs.length-1]}).y+ch/2;return {x:gutter+(r.c1-1)*cw,y:y1,w:(r.c2-r.c1+1)*cw,h:y2-y1};};
+  const rectBox=r=>{const rs=geo.rows.filter(x=>x>=r.r1&&x<=r.r2);if(!rs.length)return null;const y1=point({col:1,row:rs[0]}).y-ch/2,y2=point({col:1,row:rs[rs.length-1]}).y+ch/2;const c2=Math.min(r.c2,S.visibleCols);const x1=geo.colLeft[r.c1],x2=geo.colLeft[c2]+geo.colW[c2];return x2>x1?{x:x1,y:y1,w:x2-x1,h:y2-y1}:null;};
+  // Tables: a header band and striped rows inside their range.
+  for(const tb of state.tables||[]){const b=rectBox(tb.range);if(!b)continue;ctx.strokeStyle='#8fc7d6';ctx.lineWidth=1.5;ctx.strokeRect(b.x+1,b.y+1,b.w-2,b.h-2);if(tb.headers){const hb=rectBox({...tb.range,r2:tb.range.r1});if(hb){ctx.fillStyle='#5aa0b833';ctx.fillRect(hb.x+1,hb.y+1,hb.w-2,hb.h-2);}}}
+  // Embedded charts sit beside their data.
+  // A room with a projector window shows its empty frame until a chart is put there.
+  const win=S.chartAt?cellBox(parseCell(S.chartAt)):null;
+  if(win&&!(state.charts||[]).length){rounded(win.x+4,win.y+4,geo.cw*4.4,geo.ch*1.8,4,'#0e181188','#8fc7d666');ctx.font='12px ui-monospace,monospace';ctx.fillStyle='#8fc7d688';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('?',win.x+4+geo.cw*2.2,win.y+4+geo.ch*.9);}
+  (state.charts||[]).forEach((c,i)=>{if(win){drawBars(c.range,win.x+4,win.y+4,geo.cw*4.4,geo.ch*1.8,true);return;}const x1=geo.colLeft[Math.min(c.range.c2+2,S.visibleCols)],y1=geo.top+4+i*6,w=Math.min(geo.cw*4,width-x1-10),h=geo.ch*2.6;drawBars(c.range,x1,y1,w,h,true);});
+  for(const area of state.areas||[]){const b=rectBox({...area,c2:Math.min(area.c2,S.visibleCols),r2:Math.min(area.r2,S.visibleRows)});if(b){ctx.fillStyle='#b9df8f1c';ctx.fillRect(b.x,b.y,b.w,b.h);ctx.strokeStyle='#b9df8f99';ctx.lineWidth=1;ctx.strokeRect(b.x+.5,b.y+.5,b.w-1,b.h-1);}}
   if(ranged){const b=rectBox(vis);if(b){ctx.fillStyle='#b9df8f1c';ctx.fillRect(b.x,b.y,b.w,b.h);ctx.strokeStyle='#b9df8f99';ctx.lineWidth=1;ctx.strokeRect(b.x+.5,b.y+.5,b.w-1,b.h-1);}}
   if(state.clipboard&&state.phase==='playing'){const b=rectBox(state.clipboard.rect);if(b){ctx.strokeStyle=state.clipboard.mode==='cut'?'#f2d27e':'#c3e9ad';ctx.lineWidth=1.5;ctx.setLineDash([4,3]);ctx.lineDashOffset=reduced?0:-t/40;ctx.strokeRect(b.x+2,b.y+2,b.w-4,b.h-4);ctx.setLineDash([]);ctx.lineDashOffset=0;}}
 
@@ -455,6 +492,30 @@ function draw(t) {
   // One soft warm pulse at impact. Never white, never repeated.
   if(!reduced&&lt!==null&&lt>=T.impact&&lt<T.impact+160){ctx.fillStyle=`rgba(224,122,78,${.16*(1-(lt-T.impact)/160)})`;ctx.fillRect(0,0,width,height);}
 }
+// Bars from a two-column range: names in the first column, heights in the second; a text first row is the header.
+function drawBars(range,x,y,w,h,framed) {
+  const rows=[];for(let r=range.r1;r<=range.r2;r++){const name=displayValue(state,{col:range.c1,row:r}),val=Number(valueOf(state,{col:range.c1+1,row:r}));if(Number.isFinite(val)&&!(r===range.r1&&!Number.isFinite(Number(state.values[key({col:range.c1+1,row:r})]))))rows.push({name,val});}
+  if(framed)rounded(x,y,w,h,4,'#0e1811ee','#8fc7d6');
+  const max=Math.max(1,...rows.map(r=>r.val)),bw=w/(rows.length*1.6+.6);
+  rows.forEach((r,i)=>{const bh=(h-24)*r.val/max,bx=x+bw*.6+i*bw*1.6,by=y+h-14-bh;ctx.fillStyle=r.val===max?'#f2d27e':'#8fc7d6';ctx.fillRect(bx,by,bw,bh);ctx.font=`${Math.max(7,Math.min(10,bw*.4))}px ui-monospace,monospace`;ctx.fillStyle='#c9d8b5';ctx.textAlign='center';ctx.fillText(r.name,bx+bw/2,y+h-6);});
+}
+// A chart sheet shows only its chart.
+function drawChartSheet() {
+  const c=state.chartSheets[state.chartView];ctx.fillStyle='#111a14';ctx.fillRect(geo.gutter,geo.top,width-geo.gutter,height-geo.top);
+  drawBars(c.range,geo.gutter+30,geo.top+24,width-geo.gutter-60,height-geo.top-50,false);
+  ctx.font='10px ui-monospace,monospace';ctx.fillStyle='#8fc7d6';ctx.textAlign='left';ctx.fillText(c.name,geo.gutter+30,geo.top+14);
+}
+// The vault window: what each saved book holds in C3 and H3.
+function drawVault(atCell) {
+  const b=cellBox(atCell),books=S.vaultBooks||Object.keys(state.saved||{}),w=Math.min(geo.cw*3.2,190),h=Math.max(geo.ch*.9,16)*(books.length||1)+10,x=b.x+b.w-w,y=b.y+4;
+  rounded(x,y,w,h,4,'#0e1811ee','#56704a');
+  ctx.font=`${Math.max(8,Math.min(11,geo.cw*.15))}px ui-monospace,monospace`;ctx.textAlign='left';ctx.textBaseline='middle';
+  // Each slot: the saved file's C3 and H3, or a note that the file does not exist yet.
+  books.forEach((name,i)=>{const saved=state.saved?.[name],ly=y+8+(i+.5)*(h-10)/books.length;ctx.fillStyle=name===state.book?'#f2d27e':'#a8bd92';
+    if(!saved){ctx.fillText(`${name}.xlsx  まだない`,x+8,ly);return;}
+    const snap=saved.store[0]||{values:{}},cell=a=>{const v=snap.values[key(parseCell(a))];return isBlank(v)?'·':tokenOf(v)?'🔑':rawText(v);};
+    ctx.fillText(`${name}.xlsx  C3:${cell('C3')} H3:${cell('H3')}`,x+8,ly);});
+}
 function drawSocket(L,empty) {
   const r=L.r;rounded(L.tx-r*1.5,L.floorTop-r*1.6,r*3,r*1.55,2,'#22301f','#71845d');
   if(empty){ctx.fillStyle='#0b120b';ctx.beginPath();ctx.arc(L.tx,L.floorTop-r*.95,r*.25,0,Math.PI*2);ctx.fill();ctx.fillRect(L.tx-r*.1,L.floorTop-r*.95,r*.2,r*.5);}
@@ -504,7 +565,11 @@ function sync(){
   if(!editing)$('cellValue').textContent=isFormula(v)?v.f:rawText(v).replace(/\n/g,' ⏎ ');
   // Until the trap lands, the death has happened in the rules but not yet on screen.
   $('deathCount').textContent=pad(state.deaths-(pendingDeath?1:0));
-  $('sheetStatus').textContent=pendingDeath?'IN THE ROOM':{ready:'READY',playing:'IN THE ROOM',failed:'CAUGHT',won:'ESCAPED'}[state.phase];
+  // F8 / Shift+F8 modes show in the status bar, like Excel's EXTEND / ADD.
+  // Manual calculation with stale results shows CALCULATE, as Excel's status bar does.
+  const stale=state.cache&&Object.entries(state.values).some(([k,v])=>isFormula(v)&&state.cache[k]!==valueOf({...state,cache:null},fromKey(k)));
+  $('sheetStatus').textContent=pendingDeath?'IN THE ROOM':state.phase==='playing'&&stale?'CALCULATE':state.phase==='playing'&&state.mode?{extend:'EXTEND',add:'ADD TO SELECTION'}[state.mode]:{ready:'READY',playing:'IN THE ROOM',failed:'CAUGHT',won:'ESCAPED'}[state.phase];
+  $('fileName').textContent=state.book?`${state.book}.xlsx${state.dirty?' ●':''}`:`room_${pad(S.number)}.xlsx`;
   $('startScreen').hidden=state.phase!=='ready';
   // Panels sit on the half of the board away from the character, so the cell they act on stays visible.
   panelEl.classList.toggle('low',state.position.row<=Math.ceil(S.visibleRows/2));
@@ -519,6 +584,12 @@ function renderTabs(){
     b.addEventListener('click',()=>enterRoom(i));return b;
   });
   if(state.sheet==='new'){const b=document.createElement('button');b.className='sheet-tab active';b.innerHTML=`<span class="tab-dot"></span>${STAGES[room].newSheet?.name||'Sheet2'}`;b.disabled=true;tabs.splice(room+1,0,b);}
+  // A workbook room shows its own sheets after the room tab (switched with Ctrl+PageUp / PageDown, not by clicking).
+  else if(rootOf(state).sheetList||state.chartSheets.length){
+    const names=sheetNames(state),here=state.chartView!==null?`c${state.chartView}`:state.sheetIdx;
+    const sub=state.order.map(id=>{const b=document.createElement('button');b.className='sheet-tab sub'+(id===here?' active':'');b.disabled=true;b.innerHTML=`<span class="tab-dot"></span>${typeof id==='string'?state.chartSheets[Number(id.slice(1))].name:names[id]}`;return b;});
+    tabs[room].classList.remove('active');tabs.splice(room+1,0,...sub);
+  }
   $('sheetTabs').replaceChildren(...tabs);
   $('sheetTabs').querySelector('.active')?.scrollIntoView({block:'nearest',inline:'nearest'});
 }
@@ -546,6 +617,11 @@ function showResult(){
   $('resultKicker').textContent=won?'ESCAPED':'TRY AGAIN';$('resultTitle').textContent=won?'抜け出した。':'やられた。';
   $('resultSubtitle').textContent=won?(hasNext()?'扉の向こうに、たどり着いた。':'最後の扉を、抜けた。'):'';$('resultSubtitle').hidden=!won;
   $('nextBtn').hidden=!next;$('retryBtn').hidden=next;$('resultKey').textContent=next?'ENTER で次へ · R でもう一度':'ENTER / R';
+  // The last room: ALL CLEAR, with every room and the shortcuts it used.
+  const all=won&&!hasNext();result.classList.toggle('all-clear',all);$('allClear').hidden=!all;
+  if(all){$('resultKicker').textContent='ALL CLEAR';$('resultTitle').textContent='ぜんぶ、抜け出した。';$('resultSubtitle').textContent='50の部屋で使ったショートカット';
+    $('allClear').replaceChildren(...STAGES.map(st=>{const li=document.createElement('li');const name=document.createElement('span');name.className='ac-room';name.textContent=`${pad(st.number)} ${st.title}`;
+      const keys=document.createElement('span');keys.className='ac-keys';keys.textContent=st.keys.map(c=>c.join('＋')).join(' › ');li.append(name,keys);return li;}));}
   result.hidden=false;
   if(!isModal())$(next?'nextBtn':'retryBtn').focus({preventScroll:true});
 }
@@ -570,7 +646,7 @@ function startTrap(delay){
   schedule(delay+T.burst,burst);
   schedule(delay+T.result,showResult);
 }
-const VALUE_KINDS=new Set(['paste','edit','delete','fill','undo','replace','format','confirm']);
+const VALUE_KINDS=new Set(['paste','edit','delete','fill','undo','replace','format','confirm','structure','calc','table','save']);
 function act(next,kind,dx=0,dy=0){
   const previous=state;
   if(next===previous){
@@ -579,7 +655,8 @@ function act(next,kind,dx=0,dy=0){
     return false;
   }
   state=next;bump=null;
-  const moved=!same(previous.position,state.position)&&previous.sheet===state.sheet;
+  const sheetChanged=previous.sheet!==state.sheet||previous.sheetIdx!==state.sheetIdx||previous.chartView!==state.chartView;
+  const moved=!same(previous.position,state.position)&&!sheetChanged;
   const duration=moved?(reduced?0:(state.jump||kind==='jump')?350:115):0;
   if(moved)animation={from:previous.position,to:state.position,at:clock,duration,jump:state.jump||kind==='jump'};
   if(state.phase==='failed')startTrap(moved?duration:VALUE_KINDS.has(kind)?(state.reason==='laser'?(reduced?250:LASER_LOOK):(reduced?120:CHANGE_LOOK)):0);
@@ -589,7 +666,7 @@ function act(next,kind,dx=0,dy=0){
     if(S.exit){const p=point(S.exit);particles=Array.from({length:32},(_,i)=>({x:p.x,y:p.y-30,vx:Math.cos(i)*100,vy:Math.sin(i)*100-45,g:50,at:clock,life:900,size:3,spin:0,color:i%2?'#c7e8a8':'#e6ebcb'}));}
     schedule(reduced?0:600,showResult);
   }else{
-    if(previous.sheet!==state.sheet){renderTabs();announce('新しいシート。');}
+    if(sheetChanged){renderTabs();animation=null;announce(state.chartView!==null?state.chartSheets[state.chartView].name:state.sheet==='new'?'新しいシート。':sheetNames(state)[state.sheetIdx]);}
     beep(kind==='move'||kind==='jump'?'move':'tick');
     if(!exitOpen(S,previous)&&exitOpen(S,state))schedule(duration+80,()=>{beep('open');announce('扉が開いた。');});
   }
@@ -630,12 +707,36 @@ function openPanel(kind){
     const allowed=state.filter.allowed, boxes=filterChoices(state).map(v=>{const c=el('input',{type:'checkbox'});c.checked=!allowed||allowed.includes(v);c.dataset.value=v;return c;});
     enter=()=>{const chosen=boxes.filter(b=>b.checked).map(b=>b.dataset.value);if(!chosen.length){say('ひとつ以上選んでください。');return;}act(applyFilter(state,chosen),'filter');closePanel();};
     body=[title(cellName(S.filter.header),'Alt+↓'),...boxes.map(b=>el('label',{class:'choice'},b,b.dataset.value)),status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'OK'),closeBtn)];first=boxes[0];
-  } else if(kind==='pasteSpecial'){
-    const all=el('input',{type:'radio',name:'ps',value:'all'}),values=el('input',{type:'radio',name:'ps',value:'values'});all.checked=true;
-    enter=()=>{const r=act(paste(state,values.checked?'values':'all'),'paste');closePanel();if(!r)bump={dx:0,dy:0,lock:true,at:clock};};
-    panelEl.dataset.letters='1';
-    body=[title('形式を選択して貼り付け','Ctrl+Alt+V'),el('label',{class:'choice'},all,'すべて (A)'),el('label',{class:'choice'},values,'値 (V)'),status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'OK'),closeBtn)];first=all;
-    panel={kind,enter,pick:l=>{if(l==='v')values.checked=true;if(l==='a')all.checked=true;}};
+  } else if(kind==='pasteSpecial'||kind==='insert'||kind==='delete'){
+    // One radio list for paste special and for the insert / delete shift dialogs; a letter picks its option.
+    const opts={pasteSpecial:[['all','すべて (A)','a'],['formulas','数式 (F)','f'],['values','値 (V)','v'],['formats','書式 (T)','t'],['widths','列幅 (W)','w']],
+      insert:[['right','右方向にシフト (I)','i'],['down','下方向にシフト (D)','d']],delete:[['left','左方向にシフト (L)','l'],['up','上方向にシフト (U)','u']]}[kind];
+    const radios=opts.map(([value])=>{const r=el('input',{type:'radio',name:'opt',value});return r;});radios[0].checked=true;
+    const chosen=()=>radios.find(r=>r.checked).value;
+    enter=()=>{const v=chosen();closePanel();const r=kind==='pasteSpecial'?act(paste(state,v),'paste'):act(kind==='insert'?insertCells(state,v):deleteCells(state,v),'structure');if(!r)act(state,'locked');};
+    const heading={pasteSpecial:['形式を選択して貼り付け','Ctrl+Alt+V'],insert:['セルの挿入','Ctrl+Shift++'],delete:['削除','Ctrl+-']}[kind];
+    body=[title(...heading),...opts.map(([,label],i)=>el('label',{class:'choice'},radios[i],label)),status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'OK'),closeBtn)];first=radios[0];
+    panel={kind,enter,pick:l=>{const i=opts.findIndex(o=>o[2]===l);if(i>=0){radios[i].checked=true;radios[i].focus();}}};
+  } else if(kind==='table'){
+    const range=tableRange(state),hdr=el('input',{type:'checkbox'});hdr.checked=true;
+    enter=()=>{closePanel();if(!act(createTable(state,hdr.checked),'table'))act(state,'locked');};
+    body=[title('テーブルの作成','Ctrl+T'),el('div',{class:'scope'},range?`範囲：${cellName({col:range.c1,row:range.r1})}:${cellName({col:range.c2,row:range.r2})}`:'範囲がない'),el('label',{class:'choice'},hdr,'先頭行をテーブルの見出しとして使用する'),status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'OK'),closeBtn)];first=hdr;
+  } else if(kind==='saveAs'){
+    const input=el('input',{type:'text','aria-label':'ファイル名'});input.value=`${state.book}`;
+    enter=()=>{const name=input.value.trim();const next=saveAs(state,name);if(next===state){say('英数字の名前をつけてください。');return;}closePanel();act(next,'save');announce(`${next.book} として保存した。`);};
+    body=[title('名前を付けて保存','F12'),el('label',{},'ファイル名'),input,status,actions(el('button',{type:'button',class:'go',onclick:()=>enter()},'保存'),closeBtn)];first=input;
+    setTimeout(()=>input.select(),0);
+  } else if(kind==='menu'){
+    // Shift+F10: the menu for what is selected — whole rows, whole columns, or cells.
+    const rows=wholeRows(state),cols=wholeCols(state),items=[];
+    if(cols)items.push(['列の非表示','h',()=>act(hideCols(state),'structure')],['再表示','u',()=>act(unhideCols(state),'structure')]);
+    else if(rows)items.push(['行の非表示','h',()=>act(hideRows(state),'structure')],['再表示','u',()=>act(unhideRows(state),'structure')]);
+    else{items.push(['コピー','c',()=>act(copy(state),'clip')],['切り取り','t',()=>act(cut(state),'clip')],['貼り付け','p',()=>act(paste(state),'paste')],['挿入…','i',()=>openPanel('insert')],['削除…','d',()=>openPanel('delete')],['数式と値のクリア','n',()=>act(clearContents(state),'delete')]);
+      if(S.chartMenu)items.push(['グラフ（このシートに）','g',()=>act(addChart(state,'embedded'),'table')],['グラフシート','s',()=>act(addChart(state,'sheet'),'sheet')]);}
+    const buttons=items.map(([label,letter,run])=>el('button',{type:'button',class:'menu-item','data-letter':letter,onclick:e=>{if(e.detail>0)return;closePanel(false);run();if(!panel)focusGame();}},label));
+    enter=null;
+    body=[title('メニュー','Shift+F10'),...buttons,status];first=buttons[0];
+    panel={kind,enter,pick:l=>{const b=buttons.find(x=>x.dataset.letter===l);if(b)b.click();},nav:d=>{const i=buttons.indexOf(document.activeElement);buttons[(i+d+buttons.length)%buttons.length].focus();}};
   } else if(kind==='note'){
     body=[title(`${cellName(state.position)} のメモ`,'Shift+F2'),el('div',{class:'note-body'},S.notes[key(state.position)]),actions(closeBtn)];first=closeBtn;
   }
@@ -661,7 +762,8 @@ panelEl.addEventListener('click',e=>{
 panelEl.addEventListener('keydown',e=>{
   if(e.isComposing||e.keyCode===229){e.stopPropagation();return;}
   if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closePanel();return;}
-  if(panel?.pick&&!e.ctrlKey&&!e.metaKey&&/^[av]$/i.test(e.key)){e.preventDefault();panel.pick(e.key.toLowerCase());return;}
+  if(panel?.nav&&(e.key==='ArrowDown'||e.key==='ArrowUp')){e.preventDefault();e.stopPropagation();panel.nav(e.key==='ArrowDown'?1:-1);return;}
+  if(panel?.pick&&!e.ctrlKey&&!e.metaKey&&!(e.target instanceof HTMLInputElement&&e.target.type==='text')&&/^[a-z]$/i.test(e.key)){e.preventDefault();panel.pick(e.key.toLowerCase());return;}
   if(e.key==='Enter'&&panel?.enter&&!e.repeat&&!(e.target instanceof HTMLButtonElement)){e.preventDefault();e.stopPropagation();panel.enter();}
   if(e.key==='Enter'&&e.repeat)e.preventDefault();
   e.stopPropagation();
@@ -684,9 +786,9 @@ function closeEditor(refocus=true){
   if(!editing)return;
   editing=null;editor.hidden=true;editor.blur();sync();if(refocus)focusGame();
 }
-function commitEditor(all){
+function commitEditor(all,dir='down'){
   const text=editor.value;editing=null;editor.hidden=true;
-  const ok=act(commitEdit(state,text,{all}),'edit');
+  const ok=act(commitEdit(state,text,{all,dir}),'edit');
   if(!ok)act(state,'locked');
   sync();focusGame();
 }
@@ -699,8 +801,11 @@ editor.addEventListener('keydown',e=>{
     e.preventDefault();if(e.repeat)return;
     // Alt+Enter: a new line inside the same cell.
     if(e.altKey){const s=editor.selectionStart,t=editor.value;editor.value=t.slice(0,s)+'\n'+t.slice(editor.selectionEnd);editor.setSelectionRange(s+1,s+1);placeEditor();$('cellValue').textContent=editor.value;return;}
-    commitEditor(e.ctrlKey||(isMac&&e.metaKey));return;
+    commitEditor(e.ctrlKey||(isMac&&e.metaKey),e.shiftKey?'up':'down');return;
   }
+  if(e.key==='Tab'){e.preventDefault();commitEditor(false,e.shiftKey?'backtab':'tab');return;}
+  // Ctrl+; types today's date where the caret is.
+  if((e.ctrlKey||(isMac&&e.metaKey))&&(e.code==='Semicolon'||e.key===';')){e.preventDefault();const d=serialText(state.today),a=editor.selectionStart;editor.value=editor.value.slice(0,a)+d+editor.value.slice(editor.selectionEnd);editor.setSelectionRange(a+d.length,a+d.length);$('cellValue').textContent=editor.value;return;}
   // F4 fixes the reference under the caret (only when the caret sits on a reference).
   if(e.key==='F4'){e.preventDefault();const r=cycleReference(editor.value.toUpperCase(),editor.selectionStart);if(r){editor.value=r.text;editor.setSelectionRange(r.caret,r.caret);$('cellValue').textContent=r.text;}return;}
 });
@@ -745,12 +850,35 @@ if(!document.fullscreenEnabled)$('fullscreenBtn').hidden=true;
 canvas.addEventListener('pointerdown',()=>{if(state.phase==='playing'&&!isModal()&&!panel)focusGame();});
 // Board keys. Letters are read from e.code so ⌥ and keyboard layouts do not change them;
 // when a device sends no code, the key itself is used instead.
-const codeOf=e=>e.code||(/^[a-z]$/i.test(e.key)?`Key${e.key.toUpperCase()}`:/^[0-9]$/.test(e.key)?`Digit${e.key}`:e.key==='!'?'Digit1':e.key===' '?'Space':'');
+const codeOf=e=>e.code||(/^[a-z]$/i.test(e.key)?`Key${e.key.toUpperCase()}`:/^[0-9]$/.test(e.key)?`Digit${e.key}`:e.key==='!'?'Digit1':e.key==='('?'Digit9':e.key===')'?'Digit0':e.key===' '?'Space':e.key===';'?'Semicolon':e.key==='`'?'Backquote':e.key==='-'?'Minus':e.key==='='||e.key==='+'?'Equal':'');
 function boardKey(e){
   const code=codeOf(e), mod=e.ctrlKey||(isMac&&e.metaKey), shift=e.shiftKey, alt=e.altKey, k=e.key;
   const once=f=>{e.preventDefault();if(!e.repeat)f();return true;};
   if(state.panel)return false;
-  if(k==='Escape'){if(state.clipboard){e.preventDefault();act(cancelClipboard(state),'clip');}return true;}
+  if(k==='Escape'){e.preventDefault();if(state.clipboard)act(cancelClipboard(state),'clip');if(state.mode||(state.areas||[]).length)act(clearModes(state),'select');return true;}
+  // A chart sheet has no cells: only moving between sheets works there.
+  const sheetKey=(mod&&(k==='PageDown'||k==='PageUp'))||(alt&&!mod&&(k==='ArrowRight'||k==='ArrowLeft')&&(rootOf(state).sheetList||state.chartSheets.length));
+  if(sheetKey)return once(()=>act(switchSheet(state,k==='PageDown'||k==='ArrowRight'?1:-1),'sheet'));
+  if(state.chartView!==null){const retryKey=k.toLowerCase()==='r'&&!mod;if(!retryKey&&(k.startsWith('Arrow')||k.length===1))e.preventDefault();return !retryKey;}
+  if(k==='F8'&&!mod&&!alt)return once(()=>act(shift?toggleAdd(state):toggleExtend(state),'select'));
+  if(k==='F9'&&!mod&&!alt&&!shift)return once(()=>act(recalc(state),'calc'));
+  if(k==='F11'&&!shift&&!mod)return once(()=>act(addChart(state,'sheet'),'sheet'));
+  if(k==='F1'&&alt&&!mod)return once(()=>act(addChart(state,'embedded'),'table'));
+  if((k==='F10'&&shift)||k==='ContextMenu')return once(()=>openPanel('menu'));
+  if(k==='F12'||(mod&&shift&&code==='KeyS'))return once(()=>{if(state.book)openPanel('saveAs');});
+  if(k==='Tab')return once(()=>act(tabMove(state,shift?-1:1),'jump'));
+  if(mod&&shift&&(k==='Home'||k==='End'))return once(()=>act(selectTo(state,k==='Home'?'home':'end'),'select'));
+  if(alt&&!mod&&code==='Equal')return once(()=>openEditor(autoSumText(state)));
+  if(mod&&!alt&&(code==='Backquote'||k==='`'))return once(()=>act(toggleFormulaView(state),'view'));
+  if(mod&&!alt&&!shift&&code==='Semicolon')return once(()=>openEditor(serialText(state.today)));
+  if(mod&&shift&&(code==='Equal'||k==='+')||mod&&code==='NumpadAdd')return once(()=>{if(wholeRows(state)||wholeCols(state))act(insertCells(state),'structure');else openPanel('insert');});
+  if(mod&&!shift&&(code==='Minus'||code==='NumpadSubtract'))return once(()=>{if(wholeRows(state)||wholeCols(state))act(deleteCells(state),'structure');else openPanel('delete');});
+  if(mod&&shift&&code==='Digit9')return once(()=>act(unhideRows(state),'structure'));
+  if(mod&&shift&&code==='Digit0')return once(()=>act(unhideCols(state),'structure'));
+  if(mod&&!shift&&!alt&&code==='Digit9')return once(()=>act(hideRows(state),'structure'));
+  if(mod&&!shift&&!alt&&code==='Digit0')return once(()=>act(hideCols(state),'structure'));
+  if(mod&&!alt&&!shift&&code==='Digit5'||isMac&&e.metaKey&&shift&&code==='KeyX')return once(()=>act(toggleStyle(state,'strike'),'format'));
+  if(mod&&shift&&code==='KeyZ')return once(()=>act(redo(state),'undo'));
   if(k==='F2'&&!mod&&!alt)return once(()=>shift?(S.notes[key(state.position)]?openPanel('note'):null):(()=>{const v=state.values[key(state.position)];openEditor(isFormula(v)?v.f:rawText(v));})());
   if(k==='F11'&&shift&&!mod)return once(()=>act(newSheet(state),'sheet'));
   if(k==='Delete'&&!mod)return once(()=>{if(!act(clearContents(state),'delete')&&S.locked.has(key(state.position)))act(state,'locked');});
@@ -764,7 +892,9 @@ function boardKey(e){
   if(mod&&!alt&&!shift){
     const cmd={KeyC:()=>act(copy(state),'clip'),KeyX:()=>act(cut(state),'clip'),KeyV:()=>act(paste(state),'paste'),KeyZ:()=>act(undo(state),'undo'),
       KeyD:()=>act(fill(state,'down'),'fill'),KeyR:()=>act(fill(state,'right'),'fill'),KeyF:()=>openPanel('find'),KeyH:()=>openPanel('replace'),KeyG:()=>openPanel('goto'),
-      KeyB:()=>act(toggleBold(state),'format'),KeyA:()=>act(selectRegion(state),'select')}[code];
+      KeyB:()=>act(toggleBold(state),'format'),KeyA:()=>act(selectRegion(state),'select'),KeyY:()=>act(redo(state),'undo'),
+      KeyI:()=>act(toggleStyle(state,'italic'),'format'),KeyU:()=>act(toggleStyle(state,'underline'),'format'),KeyE:()=>act(flashFill(state),'fill'),
+      KeyS:()=>act(save(state),'save'),KeyT:()=>openPanel('table'),KeyL:()=>openPanel('table')}[code];
     if(cmd)return once(cmd);
     if(k==='Home')return once(()=>act(goHome(state),'jump'));
     if(k==='End')return once(()=>act(goEnd(state),'jump'));
@@ -791,12 +921,13 @@ document.addEventListener('keydown',e=>{
   if(dirs[key]){
     e.preventDefault();if(e.repeat||held.has(e.code)||e.altKey||state.panel)return;
     held.add(e.code);const [dx,dy]=dirs[key];
-    if(e.shiftKey)act(extend(state,dx,dy,mod),'select');else act(move(state,dx,dy,mod),'move',dx,dy);
+    if(e.shiftKey||state.mode==='extend')act(extend(state,dx,dy,mod),'select');else act(move(state,dx,dy,mod),'move',dx,dy);
     return;
   }
   // Any other printable key starts typing into the cell, replacing what is there.
   if(e.key.length===1&&!mod&&!e.altKey&&!state.panel){e.preventDefault();openEditor(e.key);}
 });
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
 // macOS does not send keyup for other keys while ⌘ is down, so releasing ⌘ frees them all.
 document.addEventListener('keyup',e=>{held.delete(e.code);if(e.key==='Meta')held.clear();});
 window.addEventListener('blur',()=>{held.clear();inputArmed=false;if(state.phase==='playing'&&!isModal()&&!panel&&!editing)$('focusNotice').hidden=false;});

@@ -47,17 +47,31 @@ function compile(def, index) {
     decor: Object.freeze((def.decor || []).map(d => Object.freeze({ ...d, at: parseCell(d.at) }))),
     indicators: Object.freeze(def.indicators || []),
     ghosts: Object.freeze((def.ghosts || []).map(([ref, text]) => Object.freeze({ at: parseCell(ref), text }))),
+    unlocked: def.unlocked ? new Set(cellsOf(def.unlocked).map(key)) : null,
+    colWidths: Object.freeze(Object.fromEntries(Object.entries(def.colWidths || {}).map(([c, w]) => [parseCell(c + '1').col, w]))),
+    hiddenRows: Object.freeze(def.hiddenRows || []), hiddenCols: Object.freeze((def.hiddenCols || []).map(c => parseCell(c + '1').col)),
+    events: Object.freeze((def.events || []).map(e => Object.freeze({ ...e, at: parseCell(e.at) }))),
+    cache: Object.freeze(def.cache ? Object.fromEntries(def.cache.map(([ref, v]) => [key(parseCell(ref)), v])) : {}),
   });
 }
 // A room's new sheet (Shift+F11) is compiled like a room of its own, sharing the room's title and hints.
+// Workbook rooms (`sheets`) compile each sheet like a room of its own; the first sheet is the room itself.
+const EMPTY = { values: [], formats: [], notes: [], traps: [], devices: [], rules: [], latches: [], selectHazards: [], decor: [], indicators: [], ghosts: [], events: [], newSheet: undefined, sheets: undefined, door: undefined, exitNeeds: undefined, exit: undefined, unlocked: undefined, locked: [], hiddenRows: [], hiddenCols: [], colWidths: {}, cache: undefined, filter: undefined, confirm: undefined, bulbs: undefined, sockets: undefined, shelf: undefined };
 const withSheet = (def, index) => {
   const stage = compile(def, index);
-  if (!def.newSheet) return stage;
-  const sheet = compile({ ...def, ...def.newSheet, values: [], formats: [], notes: [], traps: [], devices: [], rules: [], latches: [], selectHazards: [], decor: [], indicators: [], ghosts: [], newSheet: undefined, door: undefined, exitNeeds: undefined }, index);
-  return Object.freeze({ ...stage, sheet });
+  const extra = {};
+  if (def.newSheet) extra.sheet = compile({ ...def, ...EMPTY, ...def.newSheet }, index);
+  if (def.sheets) extra.sheetList = Object.freeze([stage, ...def.sheets.map(sh => compile({ ...def, ...EMPTY, calc: def.calc, ...sh }, index))]);
+  return Object.keys(extra).length ? Object.freeze({ ...stage, ...extra }) : stage;
 };
 export const STAGES = Object.freeze(STAGE_DEFS.map(withSheet));
-export const stageOf = state => state.sheet === 'new' ? STAGES[state.stage].sheet : STAGES[state.stage];
+export const rootOf = state => STAGES[state.stage];
+export function stageOf(state) {
+  const root = STAGES[state.stage];
+  if (state.sheet === 'new') return root.sheet;
+  return root.sheetList ? root.sheetList[state.sheetIdx || 0] : root;
+}
+export const sheetNames = state => (rootOf(state).sheetList || [rootOf(state)]).map(sh => sh.sheetName || 'Sheet1');
 
 // ---- values, formulas, display ----
 export const isBlank = v => v === undefined || v === null || v === '';
@@ -75,6 +89,18 @@ export function evaluate(values, v, depth = 0) {
     skip();
     if (peek() === '(') { i++; const n = sum(); skip(); i++; return n; }
     if (peek() === '-') { i++; return -atom(); }
+    const fn = /^SUM\(/.exec(src.slice(i));
+    if (fn) {
+      i += 4; let total = 0;
+      for (;;) {
+        skip();
+        const range = /^(\$?[A-Z]{1,3}\$?\d{1,7})(:(\$?[A-Z]{1,3}\$?\d{1,7}))?/.exec(src.slice(i));
+        if (range) { i += range[0].length; for (const p of cellsOf(range[1].replace(/\$/g, '') + (range[3] ? ':' + range[3].replace(/\$/g, '') : ''))) { const v = values[key(p)]; total += typeof v === 'number' || isFormula(v) ? evaluate(values, v, depth + 1) : 0; } }
+        else total += sum();
+        skip(); if (peek() === ',') { i++; continue; } if (peek() === ')') { i++; break; } i = src.length; return NaN;
+      }
+      return total;
+    }
     const ref = /^\$?[A-Z]{1,3}\$?\d{1,7}/.exec(src.slice(i));
     if (ref) { i += ref[0].length; const p = parseCell(ref[0]); return evaluate(values, values[key(p)], depth + 1); }
     const num = /^\d+(\.\d+)?/.exec(src.slice(i));
@@ -85,6 +111,13 @@ export function evaluate(values, v, depth = 0) {
   function sum() { let n = product(); for (;;) { skip(); if (peek() === '+') { i++; n += product(); } else if (peek() === '-') { i++; n -= product(); } else return n; } }
   const n = sum();
   return i >= src.length ? n : NaN;
+}
+// Every cell a formula reads, with ranges expanded.
+export function formulaRefs(v) {
+  if (!isFormula(v)) return [];
+  const out = [], re = /(\$?[A-Z]{1,3}\$?\d{1,7})(:(\$?[A-Z]{1,3}\$?\d{1,7}))?/g; let m;
+  while ((m = re.exec(v.f.slice(1)))) { if (/^SUM$/.test(m[1])) continue; out.push(...cellsOf(m[1].replace(/\$/g, '') + (m[3] ? ':' + m[3].replace(/\$/g, '') : ''))); }
+  return out;
 }
 // Relative references follow the copy; $-fixed parts stay.
 export function shiftFormula(v, dc, dr) {
@@ -108,16 +141,28 @@ export function cycleReference(text, caret) {
   }
   return null;
 }
+// Dates are day numbers counted like a spreadsheet's (1899-12-30 is day 0), shown with a date format.
+export const DATE_FMT = 'yyyy/mm/dd';
+export const dateSerial = d => Math.round((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - Date.UTC(1899, 11, 30)) / 86400000);
+export const serialText = n => { const d = new Date(Date.UTC(1899, 11, 30) + n * 86400000); return `${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`; };
 export function formatNumber(n, fmt) {
   if (Number.isNaN(n)) return '#VALUE!';
+  if (fmt === DATE_FMT) return serialText(n);
   if (fmt === '#,##0.00') return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return String(Math.round(n * 1e9) / 1e9);
+}
+// Manual calculation keeps the last computed result of each formula until F9 (or until that cell is re-entered).
+export function valueOf(state, p) {
+  const k = key(p), v = state.values[k];
+  if (isFormula(v) && state.cache && k in state.cache) return state.cache[k];
+  return evaluate(state.values, v);
 }
 export function displayValue(state, p) {
   const k = key(p), v = state.values[k], fmt = state.formats[k]?.numFmt;
   if (isBlank(v)) return '';
   if (tokenOf(v)) return v.id || v.token.toUpperCase();
-  if (isFormula(v) || typeof v === 'number') return formatNumber(evaluate(state.values, v), fmt);
+  if (isFormula(v) && state.showFormulas) return v.f;
+  if (isFormula(v) || typeof v === 'number') return formatNumber(valueOf(state, p), fmt);
   return String(v);
 }
 export const rawText = v => isBlank(v) ? '' : isFormula(v) ? v.f : tokenOf(v) ? (v.id || v.token.toUpperCase()) : String(v);
@@ -125,6 +170,8 @@ function parseInput(text) {
   if (text === '') return undefined;
   if (/^-?\d+(\.\d+)?$/.test(text.trim())) return Number(text);
   if (text.startsWith('=')) return { f: text.toUpperCase() };
+  const d = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/.exec(text.trim());
+  if (d) return { date: dateSerial(new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]))) };
   return text;
 }
 
@@ -139,7 +186,11 @@ export function selectionRect(state) {
 export const inRect = (r, p) => p.col >= r.c1 && p.col <= r.c2 && p.row >= r.r1 && p.row <= r.r2;
 const clampRect = (stage, r) => ({ c1: r.c1, r1: r.r1, c2: Math.min(r.c2, stage.visibleCols), r2: Math.min(r.r2, stage.visibleRows) });
 const rectCells = r => { const out = []; for (let row = r.r1; row <= r.r2; row++) for (let col = r.c1; col <= r.c2; col++) out.push({ col, row }); return out; };
-export const hiddenSet = state => new Set(state.hidden);
+export const hiddenSet = state => new Set([...(state.hidden || []), ...(state.hiddenRows || [])]);
+export const hiddenColSet = state => new Set(state.hiddenCols || []);
+// Every selected area: the areas kept with Shift+F8, plus the one being made now.
+export const selectionAreas = state => [...(state.areas || []), selectionRect(state)];
+const inAreas = (areas, p) => areas.some(r => inRect(r, p));
 // Excel's current region: grow the box while any non-blank cell touches its edge (diagonals included).
 export function currentRegion(state, p) {
   const has = (col, row) => !isBlank(state.values[key({ col, row })]);
@@ -156,7 +207,7 @@ export function currentRegion(state, p) {
   return r.c1 === r.c2 && r.r1 === r.r2 && !has(p.col, p.row) ? null : r;
 }
 export function usedRange(state) {
-  const keys = [...Object.keys(state.values).filter(k => !isBlank(state.values[k])), ...Object.keys(state.formats)];
+  const keys = [...Object.keys(state.values).filter(k => !isBlank(state.values[k])), ...Object.keys(state.formats).filter(k => Object.keys(state.formats[k]).length)];
   if (!keys.length) return null;
   const ps = keys.map(fromKey);
   return { c1: Math.min(...ps.map(p => p.col)), r1: Math.min(...ps.map(p => p.row)), c2: Math.max(...ps.map(p => p.col)), r2: Math.max(...ps.map(p => p.row)) };
@@ -164,9 +215,35 @@ export function usedRange(state) {
 
 // ---- conditions ----
 const valueAt = (s, c) => s.values[key(parseCell(c))];
+// Cells on another sheet of the workbook: the stored copy, or that sheet's starting contents.
+function sheetView(s, name) {
+  const root = STAGES[s.stage], list = root.sheetList || [root];
+  const idx = name === undefined ? (s.sheetIdx || 0) : list.findIndex(sh => (sh.sheetName || 'Sheet1') === name);
+  if (idx < 0) return { values: {}, formats: {}, cache: {} };
+  if (idx === (s.sheetIdx || 0) && s.sheet !== 'detached') return s;
+  return s.store?.[idx] || { values: list[idx].values, formats: list[idx].formats, cache: list[idx].cache };
+}
+function resolve(s, at) {
+  const [name, ref] = at.includes('!') ? at.split('!') : [undefined, at];
+  const view = sheetView(s, name), k = key(parseCell(ref));
+  return { view, k, v: view.values[k], f: view.formats[k] || {} };
+}
 // One small vocabulary for exits, traps, rules, latches and indicator lamps.
 export function test(stage, s, c) {
   if (c === undefined || c === null) return true;
+  if (c.saved) { const snap = s.saved?.[c.saved.book]; return !!snap && test(stage, { ...s, sheet: 'detached', store: snap.store }, c.saved.cond); }
+  if (c.book) return s.book === c.book;
+  if (c.solved) return !!s.solved[c.solved];
+  if (c.here) return same(s.position, parseCell(c.here));
+  if (c.clean) return !s.dirty;
+  if (c.blank) return isBlank(resolve(s, c.blank).v);
+  if (c.rowHidden !== undefined) return hiddenSet(s).has(c.rowHidden) === (c.is !== false);
+  if (c.colHidden) return hiddenColSet(s).has(parseCell(c.colHidden + '1').col) === (c.is !== false);
+  if (c.table) { const r = rangeOf(c.table.range); return (s.tables || []).length === 1 && s.tables.some(t => sameRect(t.range, r) && t.headers === c.table.headers); }
+  if (c.tableIncludes) return (s.tables || []).some(t => inRect(t.range, parseCell(c.tableIncludes)));
+  if (c.embedded) { const r = rangeOf(c.embedded); return (s.charts || []).some(ch => sameRect(ch.range, r)); }
+  if (c.charts) { const r = rangeOf(c.charts); return (s.charts || []).some(ch => sameRect(ch.range, r)) && (s.chartSheets || []).some(ch => sameRect(ch.range, r)); }
+  if (c.flash) return cellsOf(c.flash.cells).every((p, i) => resolve(s, cellName(p)).v === c.flash.expect[i]);
   if (typeof c === 'string') return !!deviceStatus(stage, s)[c]?.satisfied;
   if (c.all) return c.all.every(x => test(stage, s, x));
   if (c.any) return c.any.some(x => test(stage, s, x));
@@ -193,7 +270,18 @@ export function test(stage, s, c) {
       return hit;
     });
   }
-  const k = c.at ? key(parseCell(c.at)) : null, v = k ? s.values[k] : undefined, f = k ? s.formats[k] || {} : {};
+  const r = c.at ? resolve(s, c.at) : { v: undefined, f: {} }, v = r.v, f = r.f;
+  if ('computed' in c) return isFormula(v) && valueOf(r.view, fromKey(r.k)) === c.computed;
+  if ('formula' in c) return isFormula(v) && v.f === c.formula;
+  if ('sumOf' in c) {
+    if (!isFormula(v)) return false;
+    const cells = cellsOf(c.sumOf), refs = formulaRefs(v).map(key);
+    const total = cells.reduce((t, p) => t + (Number(r.view.values[key(p)]) || 0), 0);
+    return cells.every(p => refs.includes(key(p))) && valueOf(r.view, fromKey(r.k)) === total;
+  }
+  if ('today' in c) return typeof v === 'number' && v === s.today;
+  if ('style' in c) return ['bold', 'italic', 'underline', 'strike'].every(prop => !!f[prop] === !!c.style[prop]);
+  if ('width' in c) return widthOf(s, parseCell(c.at).col) === c.width;
   if ('token' in c) return tokenOf(v) === c.token;
   if ('equals' in c) return v === c.equals;
   if ('contains' in c) return typeof v === 'string' && v.includes(c.contains);
@@ -202,13 +290,22 @@ export function test(stage, s, c) {
   if ('numFmt' in c) return f.numFmt === c.numFmt;
   return false;
 }
+// Tokens across every sheet of the workbook (a key copied to another sheet is still a second key).
+export function countBookTokens(s, token) {
+  const root = STAGES[s.stage], list = root.sheetList || [root];
+  return list.reduce((n, _, i) => n + countTokens(i === (s.sheetIdx || 0) ? s.values : (s.store?.[i]?.values || list[i].values), token), 0);
+}
+export const rangeOf = ref => { const cs = cellsOf(ref); return { c1: cs[0].col, r1: cs[0].row, c2: cs[cs.length - 1].col, r2: cs[cs.length - 1].row }; };
+const sameRect = (a, b) => a.c1 === b.c1 && a.r1 === b.r1 && a.c2 === b.c2 && a.r2 === b.r2;
+export const DEFAULT_WIDTH = 8;
+export const widthOf = (s, col) => hiddenColSet(s).has(col) ? 0 : (s.colWidths?.[col] ?? DEFAULT_WIDTH);
 // What each device shows right now: one lamp per device cell, and whether it is satisfied.
 export function deviceStatus(stage, state) {
   const out = {};
   for (const d of stage.devices) {
     if (d.kind === 'selectAll') {
-      const rect = selectionRect(state), held = !!state.solved[d.id];
-      out[d.id] = { satisfied: held, lit: d.cells.map(c => held || inRect(rect, c)) };
+      const areas = selectionAreas(state), held = !!state.solved[d.id];
+      out[d.id] = { satisfied: held, lit: d.cells.map(c => held || inAreas(areas, c)) };
     } else if (d.kind === 'tokens') {
       const lit = d.cells.map(c => tokenOf(state.values[key(c)]) === d.token);
       out[d.id] = { satisfied: lit.every(Boolean) && (d.count === undefined || countTokens(state.values, d.token) === d.count), lit };
@@ -223,13 +320,30 @@ export function activeTrap(stage, state, p) {
 }
 
 // ---- state ----
-export function createState(stage = 0, deaths = 0) {
-  const s = STAGES[stage];
-  return { stage, phase: 'ready', position: { ...s.start }, previous: { ...s.start }, selectionEnd: { ...s.start }, sel: null,
-    values: { ...s.values }, formats: { ...s.formats }, clipboard: null, solved: {}, latches: {}, history: [],
-    panel: null, filter: null, hidden: [], sheet: 'main', deaths, reason: null, trap: null, jump: false };
+// The parts of the state that belong to one sheet; switching sheets stores and restores them.
+const SHEET_FIELDS = ['values', 'formats', 'position', 'previous', 'selectionEnd', 'sel', 'areas', 'hidden', 'hiddenRows', 'hiddenCols', 'colWidths', 'history', 'redo', 'cache', 'filter', 'tables', 'charts'];
+function freshSheet(sh) {
+  const cache = { ...sh.cache };
+  if (sh.calc === 'manual') for (const [k, v] of Object.entries(sh.values)) if (isFormula(v) && !(k in cache)) cache[k] = evaluate(sh.values, v);
+  return { values: { ...sh.values }, formats: { ...sh.formats }, position: { ...sh.start }, previous: { ...sh.start }, selectionEnd: { ...sh.start }, sel: null, areas: [],
+    hidden: [], hiddenRows: [...sh.hiddenRows], hiddenCols: [...sh.hiddenCols], colWidths: { ...sh.colWidths }, history: [], redo: [], cache: sh.calc === 'manual' ? cache : null, filter: null, tables: [], charts: [] };
 }
-export function begin(state) { return { ...createState(state.stage, state.deaths), phase: 'playing' }; }
+const pickSheet = s => Object.fromEntries(SHEET_FIELDS.map(f => [f, s[f]]));
+const snapshot = s => ({ store: { ...(s.store || {}), [s.sheetIdx || 0]: pickSheet(s) } });
+export function createState(stage = 0, deaths = 0, today = dateSerial(new Date())) {
+  const s = STAGES[stage];
+  const base = { stage, phase: 'ready', ...freshSheet(s), clipboard: null, solved: {}, latches: {}, fired: {},
+    panel: null, mode: null, showFormulas: false, sheet: 'main', sheetIdx: 0, store: {}, order: (s.sheetList || [s]).map((_, i) => i), chartSheets: [], chartView: null,
+    book: s.book || null, saved: {}, dirty: false, today, deaths, reason: null, trap: null, jump: false };
+  // Dates on the wall are set relative to the attempt's own today.
+  for (const [ref, offset] of s.dateValues || []) { const k = key(parseCell(ref)); base.values[k] = today + offset; base.formats[k] = Object.freeze({ numFmt: DATE_FMT }); }
+  // Some workbooks open on a later sheet; the others wait in the store untouched.
+  if (s.startSheet) Object.assign(base, freshSheet(s.sheetList[s.startSheet]), { sheetIdx: s.startSheet });
+  // A workbook room starts from an already-saved original.
+  if (s.book) base.saved = { [s.book]: snapshot(base) };
+  return base;
+}
+export function begin(state) { return { ...createState(state.stage, state.deaths, state.today), phase: 'playing' }; }
 export function restart(state) { return begin(state); }
 const playing = s => s.phase === 'playing' && !s.panel;
 const fail = (s, type, p) => ({ ...s, phase: 'failed', panel: null, deaths: s.deaths + 1, reason: type, trap: { ...p, type } });
@@ -240,24 +354,32 @@ function settle(stage, s, { values = false, selection = false } = {}) {
   for (const l of stage.latches) if (!latches[l.id] && test(stage, s, l.when)) latches = { ...latches, [l.id]: true };
   if (latches !== s.latches) s = { ...s, latches };
   if (selection) {
-    const rect = selectionRect(s);
-    for (const h of stage.selectHazards) if (h.cells.some(c => inRect(rect, c))) return fail(s, h.type, s.position);
+    const areas = selectionAreas(s);
+    for (const h of stage.selectHazards) if (h.cells.some(c => inAreas(areas, c))) return fail(s, h.type, s.position);
     let solved = s.solved;
-    // Once every plate sat inside one selection the device stays solved, even after the selection shrinks.
-    for (const d of stage.devices) if (d.kind === 'selectAll' && !solved[d.id] && d.cells.every(c => inRect(rect, c))) solved = { ...solved, [d.id]: true };
+    // Once every plate sat inside the selection the device stays solved, even after the selection shrinks.
+    for (const d of stage.devices) if (d.kind === 'selectAll' && !solved[d.id] && d.cells.every(c => inAreas(areas, c))) solved = { ...solved, [d.id]: true };
     if (solved !== s.solved) s = { ...s, solved };
   }
   if (values) for (const rule of stage.rules) {
-    const hit = rule.kind === 'tokenLimit' ? countTokens(s.values, rule.token) > rule.limit : test(stage, s, rule.when);
+    const hit = rule.kind === 'tokenLimit' ? countTokens(s.values, rule.token) > rule.limit
+      : rule.kind === 'bookTokenLimit' ? countBookTokens(s, rule.token) > rule.limit : test(stage, s, rule.when);
     if (hit) return fail(s, rule.type, s.position);
   }
   return s;
 }
 // Landing on a cell. Only the landing cell counts: cells passed over by a jump never fire.
 function arrive(stage, state, target, jump) {
-  if (same(target, state.position) || !isFloor(stage, target) || hiddenSet(state).has(target.row)) return state;
-  let s = { ...state, previous: state.position, position: target, selectionEnd: target, sel: null, jump };
-  if (stage.exit && same(target, stage.exit)) return exitOpen(stage, s) ? { ...s, phase: 'won' } : fail(s, stage.exitTrap, target);
+  if (state.chartView !== null && state.chartView !== undefined) return state;
+  if (same(target, state.position) || !isFloor(stage, target) || hiddenSet(state).has(target.row) || hiddenColSet(state).has(target.col)) return state;
+  let s = { ...state, previous: state.position, position: target, selectionEnd: target, sel: null, areas: state.mode === 'add' ? state.areas : [], jump };
+  // Floor events (a weight dropping, say) change the sheet once per attempt. They are the world, not an edit.
+  for (const e of stage.events) if (same(e.at, target) && !s.fired[key(e.at)]) {
+    const values = { ...s.values }; for (const [ref, v] of e.set) values[key(parseCell(ref))] = v;
+    s = { ...s, values, fired: { ...s.fired, [key(e.at)]: true } };
+  }
+  // An exit without a trap is simply shut until its condition holds.
+  if (stage.exit && same(target, stage.exit)) return exitOpen(stage, s) ? { ...s, phase: 'won' } : stage.exitTrap ? fail(s, stage.exitTrap, target) : state;
   const trap = activeTrap(stage, s, target);
   if (trap) return fail(s, trap.type, target);
   if (stage.confirm && same(target, stage.confirm.at)) s = { ...s, panel: { kind: 'confirm' } };
@@ -277,10 +399,14 @@ export function edge(position, dx, dy, values) {
 // Walls (anything without floor) leave the state untouched — no move, no death. Hidden rows are skipped.
 export function move(state, dx, dy, jump = false) {
   if (!playing(state) || Math.abs(dx) + Math.abs(dy) !== 1) return state;
-  const stage = stageOf(state), hidden = hiddenSet(state);
+  const stage = stageOf(state), hidden = hiddenSet(state), hiddenCols = hiddenColSet(state);
   let target;
   if (jump) target = edge(state.position, dx, dy, state.values);
-  else { target = { col: state.position.col + dx, row: state.position.row + dy }; while (dy && hidden.has(target.row)) target = { ...target, row: target.row + dy }; }
+  else {
+    target = { col: state.position.col + dx, row: state.position.row + dy };
+    while (dy && hidden.has(target.row)) target = { ...target, row: target.row + dy };
+    while (dx && hiddenCols.has(target.col)) target = { ...target, col: target.col + dx };
+  }
   return arrive(stage, state, target, jump);
 }
 export function jumpTo(state, target) {
@@ -297,9 +423,28 @@ export function extend(state, dx, dy, jump = false) {
   const stage = stageOf(state), from = state.selectionEnd;
   const end = jump ? edge(from, dx, dy, state.values) : { col: from.col + dx, row: from.row + dy };
   if (same(end, from) || !inGrid(stage, end)) return state;
+  // Whole columns (or rows) stay whole while they are widened.
+  const sel = state.sel, a = state.position;
+  if (sel && sel.r1 === 1 && sel.r2 === MAX_ROW && dx) return settle(stage, { ...state, selectionEnd: end, sel: { ...sel, c1: Math.min(a.col, end.col), c2: Math.max(a.col, end.col) } }, { selection: true });
+  if (sel && sel.c1 === 1 && sel.c2 === MAX_COL && dy) return settle(stage, { ...state, selectionEnd: end, sel: { ...sel, r1: Math.min(a.row, end.row), r2: Math.max(a.row, end.row) } }, { selection: true });
   return settle(stage, { ...state, selectionEnd: end, sel: null }, { selection: true });
 }
-const select = (state, sel) => playing(state) ? settle(stageOf(state), { ...state, sel, selectionEnd: state.position }, { selection: true }) : state;
+// Ctrl+Shift+Home / Ctrl+Shift+End: from the active cell to A1, or to the end of the used range.
+export function selectTo(state, where) {
+  if (!playing(state)) return state;
+  const r = usedRange(state), end = where === 'home' ? { col: 1, row: 1 } : r ? { col: r.c2, row: r.r2 } : null;
+  if (!end) return state;
+  return settle(stageOf(state), { ...state, selectionEnd: end, sel: null }, { selection: true });
+}
+// F8 extends with plain arrows; Shift+F8 keeps what is selected and lets another area be added.
+export function toggleExtend(state) { return playing(state) ? { ...state, mode: state.mode === 'extend' ? null : 'extend' } : state; }
+export function toggleAdd(state) {
+  if (!playing(state)) return state;
+  if (state.mode === 'add') return { ...state, mode: null };
+  return { ...state, mode: 'add', areas: [...(state.areas || []), selectionRect(state)], sel: null, selectionEnd: state.position };
+}
+export function clearModes(state) { return state.mode || (state.areas || []).length ? { ...state, mode: null, areas: [] } : state; }
+const select = (state, sel) => playing(state) ? settle(stageOf(state), { ...state, sel, selectionEnd: state.position, areas: state.mode === 'add' ? state.areas : [] }, { selection: true }) : state;
 export const selectColumn = s => select(s, { c1: s.position.col, c2: s.position.col, r1: 1, r2: MAX_ROW });
 export const selectRow = s => select(s, { c1: 1, c2: MAX_COL, r1: s.position.row, r2: s.position.row });
 // Ctrl+A: the current region first; pressed again (or from an empty spot), the whole sheet.
@@ -310,36 +455,68 @@ export function selectRegion(s) {
 }
 
 // ---- editing (every value change goes through here so Undo and the rules see it) ----
-const lockedIn = (stage, cells) => cells.some(p => stage.locked.has(key(p)));
+// A protected sheet only lets its unlocked cells be typed into; `noType` rooms refuse typing and pasting altogether.
+const isLocked = (stage, p) => stage.locked.has(key(p)) || (!!stage.unlocked && !stage.unlocked.has(key(p)));
+const lockedIn = (stage, cells) => cells.some(p => isLocked(stage, p));
 function change(state, values, formats = state.formats, extra = {}) {
   const history = [...state.history, { values: state.values, formats: state.formats }].slice(-30);
-  return settle(stageOf(state), { ...state, values, formats, history, ...extra }, { values: true });
+  let cache = state.cache;
+  // Manual calculation: a formula entered just now is worked out once; everything else keeps its old result.
+  if (cache) { cache = { ...cache }; for (const [k, v] of Object.entries(values)) if (isFormula(v) && v !== state.values[k] && !extra.keepCache?.includes(k)) cache[k] = evaluate(values, v); for (const k of Object.keys(cache)) if (!isFormula(values[k])) delete cache[k]; }
+  const { keepCache, ...rest } = extra;
+  return settle(stageOf(state), { ...state, values, formats, history, redo: [], dirty: true, cache, ...rest }, { values: true });
 }
 export function copy(state, mode = 'copy') {
   if (!playing(state)) return state;
   const rect = clampRect(stageOf(state), selectionRect(state)), cells = [];
   for (const p of rectCells(rect)) cells.push({ dc: p.col - rect.c1, dr: p.row - rect.r1, value: state.values[key(p)], format: state.formats[key(p)] });
-  return { ...state, clipboard: { mode, rect, cells } };
+  // A copied formula remembers the result it showed, for pasting into a sheet that calculates by hand.
+  const cache = cells.map(c => { const p = { col: rect.c1 + c.dc, row: rect.r1 + c.dr }; return isFormula(state.values[key(p)]) ? valueOf(state, p) : undefined; });
+  const widths = []; for (let c = rect.c1; c <= rect.c2; c++) widths.push(widthOf(state, c));
+  return { ...state, clipboard: { mode, rect, widths, cells: cells.map((c, i) => ({ ...c, cached: cache[i] })), sheetIdx: state.sheetIdx || 0 } };
 }
 export const cut = state => copy(state, 'cut');
 export function cancelClipboard(state) { return state.clipboard ? { ...state, clipboard: null } : state; }
 // Source and destination change together in one step, so a cut never counts as two keys mid-way.
 // `only: 'values'` keeps the destination's own formats (paste special → values).
+// Paste special picks parts: 'values', 'formulas', 'formats' or 'widths' (column widths only).
 export function paste(state, only = 'all') {
   if (!playing(state) || !state.clipboard) return state;
   const stage = stageOf(state), { mode, rect, cells } = state.clipboard, at = state.position;
-  if (only === 'values' && mode === 'cut') return state;
+  if (only !== 'all' && mode === 'cut') return state;
+  if (stage.noType && only !== 'widths' && only !== 'formats') return state;
   const w = rect.c2 - rect.c1, h = rect.r2 - rect.r1;
   const dest = cells.map(c => ({ col: at.col + c.dc, row: at.row + c.dr }));
-  if (!inGrid(stage, { col: at.col + w, row: at.row + h }) || lockedIn(stage, dest)) return state;
-  const values = { ...state.values }, formats = { ...state.formats };
-  if (mode === 'cut') for (const c of cells) { const k = key({ col: rect.c1 + c.dc, row: rect.r1 + c.dr }); delete values[k]; delete formats[k]; }
+  if (!inGrid(stage, { col: at.col + w, row: at.row + h })) return state;
+  if (only === 'widths') {
+    const colWidths = { ...state.colWidths };
+    for (let c = 0; c <= w; c++) colWidths[at.col + c] = state.clipboard.widths?.[c] ?? widthOf(state, rect.c1 + c);
+    return { ...state, colWidths, dirty: true };
+  }
+  if (only !== 'formats' && lockedIn(stage, dest)) return state;
+  let values = { ...state.values }, formats = { ...state.formats }, store = state.store;
+  if (mode === 'cut') {
+    const src = state.clipboard.sheetIdx || 0;
+    if (src === (state.sheetIdx || 0)) for (const c of cells) { const k = key({ col: rect.c1 + c.dc, row: rect.r1 + c.dr }); delete values[k]; delete formats[k]; }
+    else {
+      // A cut from another sheet empties the source there, in the same step.
+      const other = store[src] || freshSheet((rootOf(state).sheetList || [])[src]), ov = { ...other.values }, of = { ...other.formats };
+      for (const c of cells) { const k = key({ col: rect.c1 + c.dc, row: rect.r1 + c.dr }); delete ov[k]; delete of[k]; }
+      store = { ...store, [src]: { ...other, values: ov, formats: of } };
+    }
+  }
+  const keepCache = [], cache = state.cache ? { ...state.cache } : null;
   cells.forEach((c, i) => {
-    const k = key(dest[i]), v = mode === 'cut' ? c.value : shiftFormula(c.value, at.col - rect.c1, at.row - rect.r1);
-    if (isBlank(v)) delete values[k]; else values[k] = v;
-    if (only === 'all') { if (c.format) formats[k] = c.format; else delete formats[k]; }
+    const k = key(dest[i]);
+    if (only !== 'formats') {
+      const v = mode === 'cut' ? c.value : shiftFormula(c.value, at.col - rect.c1, at.row - rect.r1);
+      if (isBlank(v)) delete values[k]; else values[k] = v;
+      // Pasted into a sheet that calculates by hand, a formula keeps the result it had until F9.
+      if (cache && isFormula(v) && c.cached !== undefined) { cache[k] = c.cached; keepCache.push(k); }
+    }
+    if (only === 'all' || only === 'formats') { if (c.format) formats[k] = c.format; else delete formats[k]; }
   });
-  return change(state, values, formats, { clipboard: mode === 'cut' ? null : state.clipboard, sel: null, selectionEnd: { col: at.col + w, row: at.row + h } });
+  return change({ ...state, cache, store }, values, formats, { clipboard: mode === 'cut' ? null : state.clipboard, sel: null, selectionEnd: { col: at.col + w, row: at.row + h }, keepCache });
 }
 // Delete clears contents only: floor, formats and the cell itself stay.
 export function clearContents(state) {
@@ -350,22 +527,64 @@ export function clearContents(state) {
   const values = { ...state.values }; for (const k of hit) delete values[k];
   return change(state, values);
 }
-export function canEdit(state) { return playing(state) && !stageOf(state).locked.has(key(state.position)); }
-// Enter commits to the active cell and steps down; Ctrl+Enter commits the same entry to every selected cell.
-export function commitEdit(state, text, { all = false } = {}) {
+export function canEdit(state) { const stage = stageOf(state); return playing(state) && !stage.noType && !isLocked(stage, state.position); }
+// Enter commits to the active cell and steps down (Shift+Enter: up, Tab: on); Ctrl+Enter fills every selected cell.
+export function commitEdit(state, text, { all = false, dir = 'down' } = {}) {
   if (!playing(state)) return state;
-  const stage = stageOf(state), value = parseInput(text);
+  const stage = stageOf(state), parsed = parseInput(text);
+  if (stage.noType) return state;
   const targets = all ? rectCells(clampRect(stage, selectionRect(state))) : [state.position];
   if (lockedIn(stage, targets)) return state;
-  const values = { ...state.values };
+  const values = { ...state.values }, formats = { ...state.formats };
+  const value = parsed && typeof parsed === 'object' && 'date' in parsed ? parsed.date : parsed;
   for (const p of targets) {
     const v = shiftFormula(value, p.col - state.position.col, p.row - state.position.row);
     if (isBlank(v)) delete values[key(p)]; else values[key(p)] = v;
+    if (parsed && typeof parsed === 'object' && 'date' in parsed) formats[key(p)] = Object.freeze({ ...(formats[key(p)] || {}), numFmt: DATE_FMT });
   }
-  let s = change(state, values);
-  if (s.phase !== 'playing' || all) return s;
-  const below = { col: s.position.col, row: s.position.row + 1 };
-  return isFloor(stage, below) ? arrive(stage, s, below, false) : s;
+  let s = change(state, values, formats);
+  if (s.phase !== 'playing' || all || dir === 'none') return s;
+  if (dir === 'tab' || dir === 'backtab') return tabMove(s, dir === 'tab' ? 1 : -1);
+  const step = { down: [0, 1], up: [0, -1] }[dir], next = { col: s.position.col + step[0], row: s.position.row + step[1] };
+  return isFloor(stage, next) ? arrive(stage, s, next, false) : s;
+}
+// Tab / Shift+Tab: on a protected sheet, the next (or previous) unlocked cell; elsewhere one cell right (left).
+export function tabMove(state, dir = 1) {
+  if (!playing(state)) return state;
+  const stage = stageOf(state);
+  if (!stage.unlocked) return move(state, dir, 0);
+  const order = [...stage.unlocked].map(fromKey).sort((a, b) => a.row - b.row || a.col - b.col);
+  const i = order.findIndex(p => same(p, state.position));
+  const next = order[((i < 0 ? (dir > 0 ? -1 : 0) : i) + dir + order.length) % order.length];
+  return arrive(stage, state, next, true);
+}
+// Alt+= proposes a SUM over the numbers directly above (or, failing that, to the left).
+export function autoSumText(state) {
+  const p = state.position, num = q => { const v = state.values[key(q)]; return typeof v === 'number' || isFormula(v); };
+  for (const [dc, dr] of [[0, -1], [-1, 0]]) {
+    let q = { col: p.col + dc, row: p.row + dr }, first = null;
+    while (q.col >= 1 && q.row >= 1 && num(q)) { first = q; q = { col: q.col + dc, row: q.row + dr }; }
+    if (first) { const last = { col: p.col + dc, row: p.row + dr }; return `=SUM(${cellName(first)}:${cellName(last)})`; }
+  }
+  return '=SUM()';
+}
+// Ctrl+E: learn from the examples already typed in this column how the column to its left was cut, and fill the rest.
+export function flashFill(state) {
+  if (!playing(state) || stageOf(state).noType) return state;
+  const col = state.position.col, src = col - 1;
+  if (src < 1) return state;
+  const rows = []; for (let r = 1; r <= stageOf(state).visibleRows; r++) if (!isBlank(state.values[key({ col: src, row: r })])) rows.push(r);
+  const examples = rows.filter(r => typeof state.values[key({ col, row: r })] === 'string');
+  if (!examples.length) return state;
+  const rules = [];
+  for (const d of ['-', '_', ' ', '|', '.', '@', '/']) {
+    rules.push(t => t.includes(d) ? t.slice(t.lastIndexOf(d) + 1) : null, t => t.includes(d) ? t.slice(0, t.indexOf(d)) : null);
+  }
+  const rule = rules.find(fn => examples.every(r => fn(String(state.values[key({ col: src, row: r })])) === state.values[key({ col, row: r })]));
+  if (!rule) return state;
+  const values = { ...state.values };
+  for (const r of rows) if (isBlank(values[key({ col, row: r })])) { const out = rule(String(values[key({ col: src, row: r })])); if (out) values[key({ col, row: r })] = out; }
+  return change(state, values);
 }
 // Ctrl+D / Ctrl+R: the first row (column) of the selection fills the rest. With one row selected, the cell above fills it.
 export function fill(state, dir) {
@@ -387,8 +606,14 @@ export function fill(state, dir) {
 // Undo restores the last edit's cells. It never brings back walking, deaths, or world latches that already moved.
 export function undo(state) {
   if (!playing(state) || !state.history.length) return state;
-  const last = state.history[state.history.length - 1];
-  return settle(stageOf(state), { ...state, values: last.values, formats: last.formats, history: state.history.slice(0, -1) }, { values: true });
+  const last = state.history[state.history.length - 1], redo = [...(state.redo || []), { values: state.values, formats: state.formats }];
+  return settle(stageOf(state), { ...state, values: last.values, formats: last.formats, history: state.history.slice(0, -1), redo, dirty: true }, { values: true });
+}
+// Ctrl+Y puts back what Undo took away. Walking and selecting keep it; a new edit throws it away.
+export function redo(state) {
+  if (!playing(state) || !(state.redo || []).length) return state;
+  const next = state.redo[state.redo.length - 1], history = [...state.history, { values: state.values, formats: state.formats }];
+  return settle(stageOf(state), { ...state, values: next.values, formats: next.formats, history, redo: state.redo.slice(0, -1), dirty: true }, { values: true });
 }
 function formatSelection(state, apply) {
   if (!playing(state)) return state;
@@ -398,9 +623,17 @@ function formatSelection(state, apply) {
   return change(state, state.values, formats);
 }
 export const numberFormat = state => formatSelection(state, f => ({ ...f, numFmt: '#,##0.00' }));
-export function toggleBold(state) {
-  const on = !state.formats[key(state.position)]?.bold;
-  return formatSelection(state, f => { const n = { ...f }; if (on) n.bold = true; else delete n.bold; return n; });
+export function toggleStyle(state, prop) {
+  const on = !state.formats[key(state.position)]?.[prop];
+  return formatSelection(state, f => { const n = { ...f }; if (on) n[prop] = true; else delete n[prop]; return n; });
+}
+export const toggleBold = state => toggleStyle(state, 'bold');
+export const toggleFormulaView = state => playing(state) ? { ...state, showFormulas: !state.showFormulas } : state;
+// F9: work every formula out again.
+export function recalc(state) {
+  if (!playing(state) || !state.cache) return state;
+  const cache = {}; for (const [k, v] of Object.entries(state.values)) if (isFormula(v)) cache[k] = evaluate(state.values, v);
+  return settle(stageOf(state), { ...state, cache }, { values: true });
 }
 
 // ---- find, replace, go to ----
@@ -459,4 +692,94 @@ export function newSheet(state) {
   const sheet = stageOf(state).sheet;
   return { ...state, sheet: 'new', values: { ...sheet.values }, formats: {}, clipboard: null, history: [], filter: null, hidden: [], sel: null,
     previous: state.position, position: { ...sheet.start }, selectionEnd: { ...sheet.start } };
+}
+
+// ---- cell structure: insert and delete shift the cells after them ----
+function shiftCells(state, rect, dir, remove) {
+  const move = (map) => {
+    const out = {};
+    for (const [k, v] of Object.entries(map)) {
+      let p = fromKey(k);
+      const rowsHit = p.row >= rect.r1 && p.row <= rect.r2, colsHit = p.col >= rect.c1 && p.col <= rect.c2;
+      if (remove && rowsHit && colsHit) continue;
+      const w = rect.c2 - rect.c1 + 1, h = rect.r2 - rect.r1 + 1;
+      if (dir === 'right' && rowsHit && p.col >= rect.c1) p = { ...p, col: p.col + w };
+      if (dir === 'down' && colsHit && p.row >= rect.r1) p = { ...p, row: p.row + h };
+      if (dir === 'left' && rowsHit && p.col > rect.c2) p = { ...p, col: p.col - w };
+      if (dir === 'up' && colsHit && p.row > rect.r2) p = { ...p, row: p.row - h };
+      out[key(p)] = v;
+    }
+    return out;
+  };
+  return change(state, move(state.values), move(state.formats));
+}
+// Ctrl+Shift++ / Ctrl+-: whole rows or columns move as a block; otherwise the chosen direction decides.
+export function insertCells(state, dir) {
+  if (!playing(state)) return state;
+  const r = selectionRect(state);
+  if (r.c1 === 1 && r.c2 === MAX_COL) return shiftCells(state, r, 'down', false);
+  if (r.r1 === 1 && r.r2 === MAX_ROW) return shiftCells(state, r, 'right', false);
+  return shiftCells(state, clampRect(stageOf(state), r), dir === 'down' ? 'down' : 'right', false);
+}
+export function deleteCells(state, dir) {
+  if (!playing(state)) return state;
+  const r = selectionRect(state);
+  if (r.c1 === 1 && r.c2 === MAX_COL) return shiftCells(state, r, 'up', true);
+  if (r.r1 === 1 && r.r2 === MAX_ROW) return shiftCells(state, r, 'left', true);
+  return shiftCells(state, clampRect(stageOf(state), r), dir === 'up' ? 'up' : 'left', true);
+}
+export const wholeRows = state => { const r = selectionRect(state); return r.c1 === 1 && r.c2 === MAX_COL; };
+export const wholeCols = state => { const r = selectionRect(state); return r.r1 === 1 && r.r2 === MAX_ROW; };
+
+// ---- tables and charts are objects on the sheet, with their own range ----
+const dataRange = state => { const r = selectionRect(state); return r.c1 !== r.c2 || r.r1 !== r.r2 ? clampRect(stageOf(state), r) : currentRegion(state, state.position); };
+export const tableRange = dataRange;
+export function createTable(state, headers) {
+  if (!playing(state)) return state;
+  const range = dataRange(state);
+  if (!range || (state.tables || []).some(t => t.range.c1 <= range.c2 && range.c1 <= t.range.c2 && t.range.r1 <= range.r2 && range.r1 <= t.range.r2)) return state;
+  return settle(stageOf(state), { ...state, tables: [...(state.tables || []), { range, headers }], dirty: true }, { values: true });
+}
+// Alt+F1 embeds a chart in the sheet; F11 makes a chart sheet of its own and shows it.
+export function addChart(state, kind) {
+  if (!playing(state)) return state;
+  const range = dataRange(state);
+  if (!range) return state;
+  if (kind === 'embedded') return { ...state, charts: [...(state.charts || []), { range }], dirty: true };
+  const n = state.chartSheets.length, pos = state.order.indexOf(state.chartView !== null ? `c${state.chartView}` : state.sheetIdx);
+  const order = [...state.order]; order.splice(pos + 1, 0, `c${n}`);
+  return { ...state, chartSheets: [...state.chartSheets, { range, name: `Chart${n + 1}` }], order, chartView: n, dirty: true };
+}
+
+// ---- hiding rows and columns keeps their data ----
+const rowsOf = (state) => { const r = clampRect(stageOf(state), selectionRect(state)); const out = []; for (let i = r.r1; i <= r.r2; i++) out.push(i); return out; };
+const colsOf = (state) => { const r = clampRect(stageOf(state), selectionRect(state)); const out = []; for (let i = r.c1; i <= r.c2; i++) out.push(i); return out; };
+const dirtied = (stage, s) => settle(stage, { ...s, dirty: true });
+export const hideRows = state => playing(state) ? dirtied(stageOf(state), { ...state, hiddenRows: [...new Set([...(state.hiddenRows || []), ...rowsOf(state)])] }) : state;
+export const hideCols = state => playing(state) ? dirtied(stageOf(state), { ...state, hiddenCols: [...new Set([...(state.hiddenCols || []), ...colsOf(state)])] }) : state;
+export function unhideRows(state) { if (!playing(state)) return state; const rows = rowsOf(state), next = (state.hiddenRows || []).filter(r => !rows.includes(r)); return next.length === (state.hiddenRows || []).length ? state : dirtied(stageOf(state), { ...state, hiddenRows: next }); }
+export function unhideCols(state) { if (!playing(state)) return state; const cols = colsOf(state), next = (state.hiddenCols || []).filter(c => !cols.includes(c)); return next.length === (state.hiddenCols || []).length ? state : dirtied(stageOf(state), { ...state, hiddenCols: next }); }
+
+// ---- sheets of the workbook: each keeps its own cells, position and history ----
+export function switchSheet(state, delta) {
+  if (!playing(state) || state.sheet === 'new') return state;
+  const here = state.chartView !== null ? `c${state.chartView}` : state.sheetIdx, i = state.order.indexOf(here), next = state.order[i + delta];
+  if (next === undefined) return state;
+  if (typeof next === 'string') return { ...state, chartView: Number(next.slice(1)) };
+  // While a chart sheet is shown, the last worksheet's cells stay loaded; coming back to it is just a change of view.
+  if (next === state.sheetIdx) return { ...state, chartView: null };
+  const root = rootOf(state), store = { ...state.store, [state.sheetIdx]: pickSheet(state) };
+  const loaded = store[next] || freshSheet((root.sheetList || [root])[next]);
+  return { ...state, ...loaded, store, sheetIdx: next, chartView: null, mode: null, jump: false };
+}
+
+// ---- saving: the book's file is a snapshot of every sheet ----
+export function save(state) {
+  if (!playing(state) || !state.book) return state;
+  return settle(stageOf(state), { ...state, saved: { ...state.saved, [state.book]: snapshot(state) }, dirty: false });
+}
+export function saveAs(state, name) {
+  const n = String(name || '').trim().toUpperCase();
+  if (!playing(state) || !state.book || !/^[A-Z0-9_-]{1,20}$/.test(n)) return state;
+  return settle(stageOf(state), { ...state, book: n, saved: { ...state.saved, [n]: snapshot(state) }, dirty: false });
 }

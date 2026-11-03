@@ -19,8 +19,8 @@ const v = (s, a1) => s.values[key(parseCell(a1))];
 const won = s => { assert.equal(s.phase, 'won', `expected a win, got ${s.phase} (${s.reason}) at ${at(s)}`); assert.equal(s.deaths, 0); };
 const died = (s, type, msg) => { assert.equal(s.phase, 'failed', `expected a death at ${at(s)}`); if (type) assert.equal(s.reason, type, msg); assert.equal(s.deaths, 1); };
 
-test('rooms 01-30 exist and every first plain step is safe; walls never kill', () => {
-  assert.equal(STAGES.length, 30);
+test('rooms 01-50 exist and every first plain step is safe; walls never kill', () => {
+  assert.equal(STAGES.length, 50);
   for (const stage of STAGES) {
     const fresh = begin(createState(stage.index));
     for (const [dx, dy] of [[1,0],[-1,0],[0,-1],[0,1]]) {

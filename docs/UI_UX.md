@@ -2,7 +2,7 @@
 
 ## 今回の仕様
 
-一画面ずつ攻略する、キーボードを使った脱出ゲーム。第1〜30室を実装（設計は docs/Excel_Escape_Stages_01-30_Master_Design.md、第2〜5室の詳細は docs/Excel_Escape_Stages_02-05_Design.md）。
+一画面ずつ攻略する、キーボードを使った脱出ゲーム。第1〜50室を実装（設計は docs/Excel_Escape_Stages_01-50_Master_Design.md、第2〜5室の詳細は docs/Excel_Escape_Stages_02-05_Design.md）。
 
 表計算風の暗い部屋、白い小さなキャラクター、遠くに光る扉。ゲーム中にもクリア後にも学習・Excel・時短などの説明を表示しない。ヒントは右上の「？」を自分で押したときだけ出す。
 
@@ -75,3 +75,10 @@
 - キー：文字キーは `e.code` で読む（⌥やキー配列の影響を受けない）。Ctrl+R はフィル（再挑戦は修飾キーなしのR）。Mac では ⌘ を Ctrl の代わりに受け付け、⌘Space／⌘H が OS に取られる第12・19室はヒントを ⌃ 表示にする。
 - `?debug` を付けると `window.__game.state` で状態を見られる（確認用）。
 - 未確認：Mac実機での ⌃Space・⌃H・fn+⌘←（Home）・Shift+F11（F11がOSに取られる設定）、Windows版ブラウザーでの Ctrl+Shift+1 と各Ctrl系の既定動作の抑止。
+
+## 第31〜50室（実装）
+
+- 追加したExcelの意味：Redo（Ctrl+Y／Ctrl+Shift+Z。歩行や選択では消えず、新しい編集で消える）、複数範囲の選択（F8＝拡張、Shift+F8＝追加。ステータスに EXTEND／ADD TO SELECTION）、Ctrl+Shift+Home／End、保護シートのTab移動とShift+Enter／Tabでの確定、セルの挿入・削除（右／下、左／上。行・列全体なら行・列ごと）、オートSUM（Alt+=）とSUM関数、数式表示（Ctrl+`）、今日の日付（Ctrl+;。日付は数値＋日付書式）、複数シートのブック（シートごとにセル・位置・履歴を保持）、フラッシュフィル（区切り文字の前後を例から学ぶ）、テーブル（範囲と見出し）、手動計算とF9、埋め込みグラフ（Alt+F1）とグラフシート（F11）、行・列の非表示と再表示、Shift+F10 のメニュー、斜体・下線・取り消し線、形式を選択して貼り付け（数式F・書式T・列幅W）、列幅、保存と名前を付けて保存（ブックごとのスナップショット）。
+- 試遊の指摘を最初から反映：パネルはキーボード操作のみ、目指す形を盤面に出す（札・型・ランプ）、不要な偽ゴールは置かない（34室のK4、40室のArchive、45室のF6、50室のGate!L5は罠にしていない）、ショートカットを迂回できる移動は塞ぐ（31・32・34室は Ctrl+G 不可、35・36室は入力と貼り付けを封印）。
+- ブラウザーが取るキーの代わり（いずれもExcelに実在する操作）：Ctrl+PageUp/PageDown → ⌥/Alt+←/→（Mac版Excel）、Ctrl+T → Ctrl+L、Ctrl+5 → ⌘+Shift+X（Mac版Excel）、F12 → Ctrl/⌘+Shift+S（Mac版Excel）、F11・Alt+F1・非表示/再表示 → Shift+F10 のメニュー。
+- 未確認：Windows版Chromeで Ctrl+PageDown・Ctrl+T・Ctrl+5・Ctrl+9 は届かない（または届くかが未検証）。Mac実機での F8・F9・F11・F12・Shift+F10（fn併用）、JIS配列の Ctrl+` と Ctrl+;。49・50室の途中再開（チェックポイント）と保存庫の再読み込み後の復元は未実装。
